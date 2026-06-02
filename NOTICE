@@ -1,0 +1,42 @@
+Spektrafilm.exe
+A portable, standalone Windows build of spektrafilm.
+
+Copyright (C) 2026  Célian Le Bolloch
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+================================================================================
+ATTRIBUTION
+================================================================================
+
+This is a derivative work. It is a Windows packaging of the "spektrafilm"
+project by Andrea Volpato, distributed under the GNU General Public License
+version 3.
+
+Original work:
+    spektrafilm
+    Copyright (C) Andrea Volpato
+    https://github.com/andreavolpato/spektrafilm
+
+All of the spectral simulation model, the photographic pipeline, and the
+graphical user interface are the work of Andrea Volpato. This repository
+contributes only the changes required to build and run the application as a
+self-contained Windows executable. Those changes are described in the project
+README under the "Log" section.
+
+This build also bundles third-party open-source dependencies, each retaining
+its own license, including (non-exhaustively): PySide6/Qt, napari, vispy,
+numba, llvmlite, NumPy, SciPy, colour-science, rawpy, OpenImageIO, Pillow,
+dask, and others. Their respective license texts are distributed with their
+packages inside the application bundle.
