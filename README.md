@@ -182,4 +182,8 @@ Three bodies of work travel together, and each keeps its own terms:
 
 [`NOTICE.md`](NOTICE.md) is the authoritative record: the modification notice GPL-3 §5(a) requires, the copyright holders, the three tiers above, what this fork adapted from other projects, and the obligations that come with the bundled libraries and fonts. Read it before redistributing anything.
 
+## Localization (i18n)
+
+- **Simplified Chinese (简体中文)**: Available under [`patches/zh_CN/`](patches/zh_CN/). Provides comprehensive darkroom chemistry, spectral simulation, and photographic terminology translations across all UI stages, sections, and controls. See [`patches/zh_CN/README.md`](patches/zh_CN/README.md).
+
 Sample images are from [signatureedits.com](https://www.signatureedits.com/).
