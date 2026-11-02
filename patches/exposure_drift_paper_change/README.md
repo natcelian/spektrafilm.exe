@@ -19,7 +19,14 @@ It is the same pattern as the 2026-07-12 gamma compounding ("profile change stac
 
 ## Fix
 
-Remove `'exposure_compensation_ev'` from `PROFILE_SYNC_FIELDS['simulation']`, as was done for the `special` gammas, with a comment in the same place and a note in the FORK CONTRACT header. No stock sets Camera exposure as a selection default, so nothing is lost: it is a user knob. Every other read-back of the params (the Raw coupler overlay) copies only coupler fields, so this is the only path.
+Remove `'exposure_compensation_ev'` from `PROFILE_SYNC_FIELDS['simulation']`, as was done for the `special` gammas, with a comment in the same place and a note in the FORK CONTRACT header. No stock sets Camera exposure as a selection default, so nothing is lost: it is a user knob. Every other read-back of the params goes through the same field list (`_seed_sync_baseline`, `build_default_gui_state`) or copies only coupler fields (the Raw overlay), so this is the only path.
+
+Two side effects, both corrections of the same bug:
+
+- **Reset.** `baseline_look_state()` (top-bar Reset, the filmstrip's Reset settings) rebuilds the look from `_last_synced_values`, which held the composed sum. With Camera +0.7 / Film −1, one paper pick then Reset gave Camera −0.3. Now Camera exposure is not in the baseline, so Reset gives 0, its project default.
+- **The film-change status.** `_preserve_user_edits` no longer counts Camera exposure as a stock-owned edit. A film change after editing only Camera exposure no longer says "kept 1 setting you had edited", and stock specifics apply as on any change without carried edits.
+
+Values already drifted in saved roll frames, presets or state files from 2.2.1 are not repaired; they load as saved.
 
 ## Verification
 
@@ -35,5 +42,6 @@ Remove `'exposure_compensation_ev'` from `PROFILE_SYNC_FIELDS['simulation']`, as
 | +0.7 / −1 | −0.3, −1.3, … −7.3 | +0.7 throughout |
 | −0.3 / +1.5 | +1.2, +2.7, … +8 | −0.3 throughout |
 | +0.7 / 0 | +0.7 throughout | +0.7 throughout |
+| Reset after a paper pick (+0.7 / −1, an image open) | Camera −0.3 | Camera 0 |
 
 With `--dump`, the full GUI state is saved after each of the 32 picks for both builds, and `--compare original.json patched.json` diffs them. The only difference is Camera exposure, so every stock-owned value still syncs exactly as before.

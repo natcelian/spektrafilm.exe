@@ -12,12 +12,17 @@ simulation.exposure_compensation_ev.
 import json
 import os
 import sys
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict
+
+
+def load_json(path):
+    with open(path, encoding='utf-8') as file:
+        return json.load(file)
 
 
 def compare(original_path, patched_path):
-    original = json.load(open(original_path, encoding='utf-8'))
-    patched = json.load(open(patched_path, encoding='utf-8'))
+    original = load_json(original_path)
+    patched = load_json(patched_path)
     differences = []
     for step, (a, b) in enumerate(zip(original, patched)):
         for key in sorted(set(a) | set(b)):
@@ -99,6 +104,35 @@ for camera_ev, film_ev in ((0.0, -1.0), (0.7, -1.0), (0.7, 0.0), (-0.3, 1.5)):
           f"(seen {', '.join(f'{v:+.2f}' for v in seen)})")
     check(f'Film exposure {film_ev:+.1f} untouched', abs(float(sim.film_exposure_ev.value) - film_ev) < 1e-9)
 
+# 3. Reset (top bar / filmstrip) goes back to the stock baseline, which must not
+#    hold the composed Camera + Film sum
+import tempfile  # noqa: E402
+import time  # noqa: E402
+
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+
+image_path = os.path.join(tempfile.mkdtemp(), 'reset_test.png')   # Reset needs an open image
+Image.fromarray(np.full((60, 90, 3), 120, dtype=np.uint8)).save(image_path)
+controller.load_input_image(image_path)
+deadline = time.time() + 60
+while not controller._current_input_path and time.time() < deadline:
+    qapp.processEvents()
+    time.sleep(0.05)
+sim.film_exposure_ev.value = -1.0
+sim.exposure_compensation_ev.value = 0.7
+qapp.processEvents()
+pick('print_paper', 'kodak_supra_endura')
+baseline = controller.baseline_look_state()
+check('Reset baseline: Camera exposure 0, Film exposure 0 (not the drifted sum)',
+      baseline.simulation.exposure_compensation_ev == 0.0 and baseline.simulation.film_exposure_ev == 0.0,
+      f'(baseline Camera {baseline.simulation.exposure_compensation_ev:+.2f}, '
+      f'Film {baseline.simulation.film_exposure_ev:+.2f})')
+controller.reset_current_image()
+qapp.processEvents()
+check('top-bar Reset leaves Camera exposure at 0', abs(float(sim.exposure_compensation_ev.value)) < 1e-9,
+      f'(Camera exposure after Reset {float(sim.exposure_compensation_ev.value):+.2f})')
+
 # 4. No stock sets Camera exposure as a selection default
 from spektrafilm.runtime.api import init_params  # noqa: E402
 from spektrafilm_gui.options import FilmStocks, PrintStocks  # noqa: E402
@@ -116,7 +150,8 @@ check(f'no film or paper sets Camera exposure as a selection default ({len(pairs
       not moved, f'({moved[:5]})')
 
 if DUMP:
-    json.dump(dumps, open(DUMP, 'w', encoding='utf-8'), indent=1)
+    with open(DUMP, 'w', encoding='utf-8') as file:
+        json.dump(dumps, file, indent=1)
     print(f'state after each of {len(dumps)} picks written to {DUMP}')
 print('\nFAILURES:', failures if failures else 'none')
 sys.exit(1 if failures else 0)

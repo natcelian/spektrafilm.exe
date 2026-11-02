@@ -3,7 +3,8 @@
 # OURS: PROFILE_SYNC_FIELDS, per-FIELD rather than upstream's per-section
 #   list, so a stock switch overwrites only stock-owned values; 'special' is
 #   excluded on purpose (it compounded push/pull gamma, 2026-07-12), and
-#   so is simulation.exposure_compensation_ev (it compounded Film exposure);
+#   so is simulation.exposure_compensation_ev (it compounded Film exposure
+#   into Camera exposure, 2026-11-01);
 #   grain.rms_granularity added in 20C; Phase 15 update_baselines.
 # UPSTREAM: the idea: sync widgets to the chosen profile's defaults.
 # ON CONFLICT: KEEP OURS. Map any section upstream adds to
@@ -107,8 +108,10 @@ PROFILE_SYNC_FIELDS: dict[str, tuple[str, ...]] = {
     # params.camera.exposure_compensation_ev, and gui_state_from_params reads
     # that SUM back, so every switch added Film exposure to Camera exposure
     # again (-1, -2, -3 ... with Film exposure at -1; a paper change always,
-    # a film change whenever Camera exposure was unedited). No stock sets it,
-    # so it is a user knob, not a selection default.
+    # a film change whenever Camera exposure had not been edited since the
+    # last stock sync; pixls.us report). The composed sum also became the
+    # Reset baseline. No stock sets it, so it is a user knob, not a
+    # selection default.
     'simulation': (
         'film_stock',
         'film_format_mm',
