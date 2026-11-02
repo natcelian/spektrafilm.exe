@@ -53,18 +53,24 @@ def main(internal, mode):
     for stock in STOCKS:
         path = profiles / f'{stock}.json'
         backup = path.with_name(path.name + '.orig')
-        if mode == '--restore':
-            if backup.exists():
-                shutil.copy2(backup, path)
-                print(f'{stock}: restored from {backup.name}')
-            else:
-                print(f'{stock}: no backup, left as is')
-            continue
-
         payload = json.loads(path.read_text(encoding='utf-8'))
         data = payload['data']
         total = np.asarray(data['density_curves'], dtype=float)
         shipped = np.asarray(data['density_curves_layers'], dtype=float)
+        shipped_error = float(np.nanmax(np.abs(np.nansum(shipped, axis=1) - total)))
+        if mode == '--restore':
+            if not backup.exists():
+                print(f'{stock}: no backup, left as is')
+            elif shipped_error > TOLERANCE:
+                # Not a file this script wrote (an app update shipped a new
+                # one): the backup is older than it, so restoring would
+                # downgrade the profile.
+                print(f'{stock}: not patched by this script, backup left unused')
+            else:
+                shutil.copy2(backup, path)
+                print(f'{stock}: restored from {backup.name}')
+            continue
+
         try:
             regenerated = model_layers(data['density_curves_model'], data['log_exposure'],
                                        payload['info']['type'])
@@ -72,7 +78,6 @@ def main(internal, mode):
             print(f'{stock}: cannot evaluate the model ({exc}), NOT changed')
             failed = True
             continue
-        shipped_error = float(np.nanmax(np.abs(np.nansum(shipped, axis=1) - total)))
         model_error = float(np.nanmax(np.abs(np.nansum(regenerated, axis=1) - total)))
         print(f'{stock}: sum(sub-layers) vs total, shipped {shipped_error:.4f}, regenerated {model_error:.4f}')
 
@@ -87,9 +92,12 @@ def main(internal, mode):
             continue
 
         data['density_curves_layers'] = np.round(regenerated, 6).tolist()
-        if not backup.exists():
-            shutil.copy2(path, backup)
-        path.write_text(json.dumps(payload, indent=4), encoding='utf-8')
+        # Only a file still carrying the stale sub-layers gets here, so it IS
+        # the original: back it up every time, replacing a backup left from an
+        # earlier run against an older release.
+        shutil.copy2(path, backup)
+        # newline: keep the shipped LF line endings (Windows would write CRLF)
+        path.write_text(json.dumps(payload, indent=4), encoding='utf-8', newline='\n')
         print(f'{stock}: written (backup {backup.name})')
 
     if mode not in ('--apply', '--restore'):

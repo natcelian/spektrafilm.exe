@@ -87,6 +87,8 @@ python fix_installed_profiles.py "<...>\TheDyeworks\_internal" --apply    # writ
 python fix_installed_profiles.py "<...>\TheDyeworks\_internal" --restore  # undo
 ```
 
+A backup is written on every `--apply` that changes a file, so it is always the release the file came from (an app update that re-ships the old data gets a fresh backup). `--restore` only puts a backup back over a file this script wrote; after an update it leaves the new file alone rather than downgrade it. Files keep their LF line endings.
+
 With only this applied to the unpatched 2.2.1 code, `verify_fix.py` passes everything the runtime patch passes. If you prefer to fix the data rather than the code, the same regenerated arrays can go straight into the repository's profiles.
 
 ## Not fixed here: fog
