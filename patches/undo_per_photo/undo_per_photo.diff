@@ -1,0 +1,91 @@
+--- a/src/spektrafilm_gui/controller.py
++++ b/src/spektrafilm_gui/controller.py
+@@ -1045,13 +1045,17 @@
+     # ------------------------------------------------------------------
+     # Undo / redo: a debounced stack of GUI-state snapshots. Covers every
+     # parameter change (anything wired to auto-preview); loading files and
+-    # roll membership are not part of the stack.
++    # roll membership are not part of the stack. One stack PER IMAGE
++    # (`_use_history_of_current`): `_history` is the open image's.
+     # ------------------------------------------------------------------
+     _HISTORY_LIMIT = 100
++    _HISTORY_IMAGES = 30            # images whose stacks are kept, newest first
+     _history: list | None = None
+     _history_index: int = -1
+     _history_applying: bool = False
+     _history_timer = None
++    _history_owner = None           # the image `_history` belongs to
++    _history_stacks: dict | None = None   # the other images' (stack, index)
+ 
+     # ------------------------------------------------------------------
+     # Test strip (Phase 17C): EV bands on the image. A triggered
+@@ -1981,6 +1985,9 @@
+             hide_output=True,
+         )
+         self._update_banner_and_metadata(image)
++        # The image's own undo stack starts at the look it opened with, so
++        # its first edit can be undone too (`_use_history_of_current`).
++        self._history_push_now()
+ 
+     def _update_banner_and_metadata(self, image: np.ndarray) -> None:
+         banner = getattr(self._widgets, 'banner', None)
+--- a/src/spektrafilm_gui/controller_history.py
++++ b/src/spektrafilm_gui/controller_history.py
+@@ -4,6 +4,8 @@
+ """
+ from __future__ import annotations
+ 
++import os
++
+ from qtpy import QtCore
+ 
+ from spektrafilm_gui.shell_layout import set_status
+@@ -31,7 +33,32 @@
+         # Debounce: rapid slider/spinbox streams collapse into one snapshot.
+         self._history_timer.start(700)
+ 
++    def _use_history_of_current(self) -> None:
++        """Make `_history` the open image's own stack.
++
++        One stack for everything recorded switching images as an edit: the
++        incoming image's look lands in the panels like any change, so Ctrl+Z
++        right after a switch put the PREVIOUS image's look on the new one.
++        Keyed by the image, the switch is not a step at all, and coming back
++        to an image brings its own undo and redo back. Checked lazily, at
++        every push, undo and redo, so no load path has to remember it.
++        """
++        path = self._current_input_path
++        key = os.path.normcase(os.path.abspath(path)) if path else None
++        if key == self._history_owner:
++            return
++        if self._history_stacks is None:
++            self._history_stacks = {}
++        if self._history:
++            # Re-inserted last: the dict's order is newest-last.
++            self._history_stacks[self._history_owner] = (self._history, self._history_index)
++            while len(self._history_stacks) > self._HISTORY_IMAGES:
++                del self._history_stacks[next(iter(self._history_stacks))]
++        self._history, self._history_index = self._history_stacks.pop(key, ([], -1))
++        self._history_owner = key
++
+     def _history_push_now(self) -> None:
++        self._use_history_of_current()
+         snapshot = gui_state_to_dict(collect_gui_state(widgets=self._widgets))
+         if self._history is None:
+             self._history = []
+@@ -45,6 +72,7 @@
+         self._history_index = len(self._history) - 1
+ 
+     def undo(self) -> None:
++        self._use_history_of_current()
+         # Flush a pending debounce first so the current edit is undoable.
+         if self._history_timer is not None and self._history_timer.isActive():
+             self._history_timer.stop()
+@@ -56,6 +84,7 @@
+         self._history_apply(f'Undo ({self._history_index + 1}/{len(self._history)})')
+ 
+     def redo(self) -> None:
++        self._use_history_of_current()
+         if not self._history or self._history_index >= len(self._history) - 1:
+             set_status(self._viewer, 'Nothing to redo')
+             return
