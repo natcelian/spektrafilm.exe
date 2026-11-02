@@ -44,6 +44,11 @@ if not args:
 SRC = args[0]
 DUMP = sys.argv[sys.argv.index('--dump') + 1] if '--dump' in sys.argv else None
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+# A throwaway settings file: without it the app reads and writes the real
+# settings store (the registry on Windows), see spektrafilm_gui.app_settings.
+import tempfile  # noqa: E402
+SCRATCH = tempfile.mkdtemp(prefix='test_exposure_drift_')
+os.environ.setdefault('SPEKTRAFILM_SETTINGS_INI', os.path.join(SCRATCH, 'settings.ini'))
 sys.path.insert(0, SRC)
 
 from qtpy import QtWidgets  # noqa: E402
@@ -106,13 +111,12 @@ for camera_ev, film_ev in ((0.0, -1.0), (0.7, -1.0), (0.7, 0.0), (-0.3, 1.5)):
 
 # 3. Reset (top bar / filmstrip) goes back to the stock baseline, which must not
 #    hold the composed Camera + Film sum
-import tempfile  # noqa: E402
 import time  # noqa: E402
 
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
-image_path = os.path.join(tempfile.mkdtemp(), 'reset_test.png')   # Reset needs an open image
+image_path = os.path.join(SCRATCH, 'reset_test.png')   # Reset needs an open image
 Image.fromarray(np.full((60, 90, 3), 120, dtype=np.uint8)).save(image_path)
 controller.load_input_image(image_path)
 deadline = time.time() + 60
@@ -153,5 +157,7 @@ if DUMP:
     with open(DUMP, 'w', encoding='utf-8') as file:
         json.dump(dumps, file, indent=1)
     print(f'state after each of {len(dumps)} picks written to {DUMP}')
+import shutil  # noqa: E402
+shutil.rmtree(SCRATCH, ignore_errors=True)
 print('\nFAILURES:', failures if failures else 'none')
 sys.exit(1 if failures else 0)
