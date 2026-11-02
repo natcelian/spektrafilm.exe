@@ -1,0 +1,21 @@
+--- a/src/spektrafilm_gui/controller_ratings.py
++++ b/src/spektrafilm_gui/controller_ratings.py
+@@ -14,6 +14,10 @@
+         current = self._roll.current
+         if current is not None:
+             return self._roll.rating_for(current)
++        # A single image's rating is ITS rating. It used to follow every image
++        # opened after it, and into their EXIF on export.
++        if self._single_rating_path != self._current_input_path:
++            return 0
+         return int(self._single_rating)
+ 
+     def set_current_rating(self, rating: int) -> None:
+@@ -26,6 +30,7 @@
+                 self._roll_refresh_view()
+         else:
+             self._single_rating = rating
++            self._single_rating_path = self._current_input_path
+         self._sync_rating_panel()          # reflect keyboard shortcuts in the stars
+         set_status(self._viewer,
+                    f'Rating: {rating} of 5' if rating else 'Rating cleared')

@@ -1,0 +1,53 @@
+--- a/src/spektrafilm_gui/widget_sections.py
++++ b/src/spektrafilm_gui/widget_sections.py
+@@ -1341,6 +1341,8 @@
+ 
+         form = _new_form_layout()
+         self._editors: dict[str, QLineEdit] = {}
++        #: exiv2 key -> the loaded file's value as prefilled (`set_camera_lens`)
++        self._prefilled: dict[str, str] = {}
+         for attr, label, key in self._FIELDS:
+             editor = QLineEdit()
+             editor.setToolTip(f'Optional; applied to every exported file ({key}). Leave empty to skip.')
+@@ -1368,17 +1370,34 @@
+ 
+     def custom_tags(self) -> dict:
+         """Non-empty editable fields as exiv2 EXIF keys (the per-frame Rating
+-        is merged controller-side so batch export stays per-frame)."""
+-        return {key: editor.text().strip() for key, editor in self._editors.items() if editor.text().strip()}
++        is merged controller-side so batch export stays per-frame).
++
++        A Camera/Lens Model still showing the loaded file's own value is left
++        out: the export copies the source file's tags anyway, and writing the
++        prefill stamped the CURRENT frame's camera onto every frame of a roll
++        export (and wrote make + model into the Model tag).
++        """
++        return {key: editor.text().strip() for key, editor in self._editors.items()
++                if editor.text().strip() and editor.text().strip() != self._prefilled.get(key)}
+ 
+     def set_camera_lens(self, camera_model: str = '', lens_model: str = '') -> None:
+         """Prefill Camera/Lens Model from the loaded file (does not overwrite a
+         value the user has typed). Values are raw metadata, not UI labels, so
+-        they are inserted verbatim."""
+-        if camera_model and not self.camera_model.text().strip():
+-            self.camera_model.setText(str(camera_model))
+-        if lens_model and not self.lens_model.text().strip():
+-            self.lens_model.setText(str(lens_model))
++        they are inserted verbatim.
++
++        A box still holding the PREVIOUS file's prefill follows the new file,
++        emptied when the new file records none. It used to fill only an empty
++        box, so the first file's camera and lens stayed for the session and
++        went into every later export (a Fuji X100 export written with a Sony
++        model and lens). A prefill is only shown, never written: see
++        `custom_tags`.
++        """
++        for key, editor, value in (('Exif.Image.Model', self.camera_model, camera_model),
++                                   ('Exif.Photo.LensModel', self.lens_model, lens_model)):
++            current = editor.text().strip()
++            if not current or current == self._prefilled.get(key):
++                editor.setText(str(value or ''))
++                self._prefilled[key] = str(value or '').strip()
+ 
+ 
+ class SimulationSection(DataclassSection):
