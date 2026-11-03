@@ -1,0 +1,1773 @@
+--- a/src/spektrafilm_gui/controller_crop.py
++++ b/src/spektrafilm_gui/controller_crop.py
+@@ -4,11 +4,16 @@
+ """
+ from __future__ import annotations
+ 
++import math
++from contextlib import contextmanager
++
+ import numpy as np
++from qtpy import QtCore, QtWidgets
+ 
+ from spektrafilm_gui import controller_runtime as runtime
++from spektrafilm_gui import notices
+ from spektrafilm_gui.app_settings import app_settings
+-from spektrafilm_gui.controller_layers import INPUT_LAYER_NAME
++from spektrafilm_gui.controller_layers import INPUT_LAYER_NAME, INPUT_PREVIEW_LAYER_NAME
+ from spektrafilm_gui.params_mapper import build_params_from_state
+ from spektrafilm_gui.shell_layout import dialog_parent, set_canvas_background_color
+ from spektrafilm_gui.shell_layout import set_status
+@@ -16,25 +21,507 @@
+ from spektrafilm_gui.crop_frame import (
+     MIN_CROP_SIZE,
+     angle_from_line,
++    clamp_rect,
+     crop_rect_uv,
+     fit_rect_about_centre,
++    fit_rect_in_rotated_image,
+     furthest_drag,
++    oriented_ratio,
+     parse_ratio,
+     rect_fits_rotated_image,
+     rect_inside_frame,
+     rect_to_center_size,
+     refit_to_ratio,
+     resize_rect,
+-    swap_ratio_label,
+     swap_rect_orientation,
+ )
+ from spektrafilm_gui.canvas_backgrounds import CANVAS_BACKGROUND_OPTIONS
+ from spektrafilm_gui.loupe import frozen_autoexposure_ev
+ 
+ 
++#: what crop_center / crop_size keep (their four decimals, widget_specs)
++CROP_FIELD_STEP = 1e-4
++
++
++class _EscapeCancelsCrop(QtCore.QObject):
++    """An Esc that reaches the main window -- one nothing under the focus
++    used (the slider, the panel) -- cancels the open crop. A field, a
++    popover or a menu that takes Esc keeps it."""
++
++    def __init__(self, cancel) -> None:
++        super().__init__()
++        self._cancel = cancel
++
++    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API name
++        if event.type() == QtCore.QEvent.KeyPress and event.key() == QtCore.Qt.Key_Escape:
++            self._cancel()
++            return True
++        return False
++
++
+ class CropMixin:
+     """GuiController's crop methods."""
+ 
++    # THE CROP SESSION is the armed crop frame. Its controls live in Scan >
++    # Frame (Aspect ratio and orientation, Angle, Constrain to image,
++    # Straighten, Reset, and while it is open Cancel · Done); the canvas only
++    # has the frame. Nothing applies until Done. Typing or dragging an angle
++    # opens it, as do the rail's crop button, a ratio or orientation pick and
++    # a straighten line. The frame on screen is always `_frame_base_uv` (the
++    # frame the user set, or the stored crop) fitted to the current angle --
++    # never the previous fit refitted, which shrank it every time.
++    _crop_session_render = None
++    _crop_escape = None
++    _frame_initial_portrait = False
++    #: (key, unturned float frame, output colour space, display transform):
++    #: the crop's film rendered once without the turn (`_crop_turn_fast_path`)
++    _crop_flat = None
++    _crop_flat_pending = None
++    _crop_scopes_timer = None
++    #: the desqueeze when the crop opened, for Cancel (Reset includes it)
++    _frame_initial_desqueeze = None
++    _skew_last_seen = 0.0
++    _frame_base_uv = None
++    _frame_from_straighten = False
++    _crop_constrain = True
++    #: (handle, frame at the press, total drag so far) while a handle is held
++    _frame_drag_from = None
++    #: True while the tool itself puts an angle back (Cancel, Reset)
++    _skew_quiet = False
++
++    def _connect_crop_session(self) -> None:
++        """Wired here so the protected app.py stays untouched."""
++        editor = getattr(getattr(self._widgets, 'scan_finishing', None), 'skew_deg', None)
++        if editor is None:
++            return
++        from spektrafilm_gui.dyeworks_editors import on_editor_changed
++
++        from spektrafilm_gui.state_bridge import on_restore
++
++        self._skew_last_seen = float(editor.value)
++        on_editor_changed(editor, self._on_skew_changed)
++        on_restore(self._apply_crop_session_before_restore)
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is not None:
++            frame.crop_done_requested.connect(lambda: self._frame_commit())
++            frame.crop_cancel_requested.connect(lambda: self.cancel_crop_session())
++            frame.constrain_toggled.connect(self.set_crop_constrain)
++            frame.orientation_chosen.connect(self._orientation_chosen)
++            frame.set_constrain(self._read_constrain())
++
++    def _apply_crop_session_before_restore(self) -> None:
++        """Reset, a preset, a pasted look or a version put back during a
++        session: the session is applied first, as leaving the photo does."""
++        self.apply_crop_session('Crop applied')
++
++    def crop_session_active(self) -> bool:
++        return self._frame_rect_uv is not None
++
++    def _frame_state(self) -> tuple:
++        """(crop on, centre, size, angle): what Cancel puts back."""
++        finishing_widgets = self._widgets.scan_finishing
++        return (bool(finishing_widgets.crop.value),
++                tuple(float(v) for v in finishing_widgets.crop_center.value),
++                tuple(float(v) for v in finishing_widgets.crop_size.value),
++                float(finishing_widgets.skew_deg.value))
++
++    def _on_skew_changed(self, *_args) -> None:
++        """The angle moved. In a session: refit the frame. Otherwise any
++        change the USER makes opens one -- typed, dragged, scrolled, pasted,
++        reset, from whichever row shows the field -- and a restored look
++        (undo, presets, roll frames, versions: `state_bridge.restoring`)
++        never does. Sorting mode shows a thumbnail, not the photo to fit."""
++        from spektrafilm_gui.state_bridge import is_restoring
++
++        editor = self._widgets.scan_finishing.skew_deg
++        before, self._skew_last_seen = self._skew_last_seen, float(editor.value)
++        if self._skew_quiet:
++            return
++        if self.crop_session_active():
++            self._refit_session_frame()
++            self._schedule_session_render()
++            return
++        if not self._crop_session_allowed():
++            return
++        crop_active, center, size, _skew = self._frame_state()
++        self._open_crop_session((crop_active, center, size, before))
++
++    def _crop_session_allowed(self) -> bool:
++        """Not while a stored look is put back, not in Input mode (a
++        thumbnail, not the photo), and only with a photo on the canvas."""
++        from spektrafilm_gui.state_bridge import is_restoring
++
++        return not (is_restoring() or self._input_mode
++                    or self._gpu_canvas is None or self._current_input_image is None)
++
++    def _open_crop_session(self, initial=None) -> None:
++        """`initial`: the state before an edit that has already landed (a
++        typed angle); None opens on the state now."""
++        focus = QtWidgets.QApplication.focusWidget() if initial is not None else None
++        if initial is not None:
++            self._record_look_before_edit(initial[3])
++        self._crop_tool_mode = 'frame'
++        self._arm_crop_frame(initial)
++        self._sync_crop_buttons(True)
++        if focus is not None:
++            focus.setFocus()        # keep typing where the user is typing
++
++    @contextmanager
++    def _angle_put_back(self):
++        """The tool itself setting the angle (Cancel, Reset): the row and the
++        render follow as for any change; only the watcher above stays out."""
++        self._skew_quiet = True
++        try:
++            yield self._widgets.scan_finishing.skew_deg
++        finally:
++            self._skew_quiet = False
++
++    def _record_look_before_edit(self, angle_before: float) -> None:
++        """The session lands as ONE undo step on top of the look before the
++        edit that opened it -- and that edit has already landed, so put the
++        old angle back for the record, silently, and return. (Blocked, not
++        `_angle_put_back`: nothing may render the old angle.)"""
++        editor = self._widgets.scan_finishing.skew_deg
++        inner = getattr(editor, '_inner', None)
++        angle_now = float(editor.value)
++        blocked = [(widget, widget.blockSignals(True)) for widget in (editor, inner) if widget is not None]
++        try:
++            editor.value = angle_before
++            self.history_flush()
++            editor.value = angle_now
++        finally:
++            for widget, was_blocked in blocked:
++                widget.blockSignals(was_blocked)
++
++    def cancel_crop_session(self, reason: str = '', *, refresh: bool = True) -> None:
++        """Leave the session without applying it (Cancel, Esc, undo, and a
++        turn or mirror of the photo, which the frame no longer fits)."""
++        if self.crop_session_active():
++            self._frame_cancel(reason, refresh=refresh)
++
++    def apply_crop_session(self, reason: str) -> None:
++        """Leaving the photo applies the session, as leaving Lightroom's crop
++        tool does: the angle typed is kept, with the frame that keeps its
++        corners out. Quietly -- the photo is going away -- and with no render
++        (the load that follows renders).
++
++        Three doors out of a photo, each calls this once:
++        - `roll_activate`, BEFORE the outgoing frame's look is stored;
++        - `load_raw_image` / `load_input_image` for a different file (the
++          roll's own loads, a dropped file; a re-decode of the same file
++          keeps the session);
++        - `state_bridge.on_restore`, for a look put back in place (Reset, a
++          preset, a pasted look, a version, roll exposure);
++        and `set_input_mode(True)`, which hides the photo behind its thumbnail.
++        A turn or mirror of the photo CANCELS instead: the frame was fitted
++        to the photo as it was."""
++        if self.crop_session_active():
++            self._frame_commit(announce=False, refresh=False, message=reason)
++
++    def _ratio_combo(self):
++        return getattr(getattr(self._widgets, 'scan_frame', None), 'ratio_combo', None)
++
++    def _locked_ratio(self, image_wh):
++        """The picked ratio (width/height) in the chosen orientation, or None
++        for Free."""
++        frame = getattr(self._widgets, 'scan_frame', None)
++        combo = self._ratio_combo()
++        ratio = parse_ratio(str(combo.currentText()) if combo is not None else '', image_wh)
++        return oriented_ratio(ratio, bool(frame is not None and frame.portrait()))
++
++    def _whole_frame_uv(self, image_wh) -> tuple:
++        """The whole photo, at the locked aspect when there is one."""
++        ratio = self._locked_ratio(image_wh)
++        if ratio is None:
++            return (0.0, 0.0, 1.0, 1.0)
++        return refit_to_ratio((0.0, 0.0, 1.0, 1.0), ratio, image_wh)
++
++    def _is_straighten_crop(self, state, image_wh) -> bool:
++        """True when the stored crop is EXACTLY what Done writes for a
++        straighten of the whole frame at that angle -- the crop the
++        straighten added, which goes when the angle goes back to 0."""
++        crop_active, center, size, skew = state
++        if not crop_active or abs(skew) < 1e-9:
++            return False
++        fitted = fit_rect_about_centre(self._whole_frame_uv(image_wh), skew, image_wh)
++        fit_center, fit_size = self._stored_crop(fitted, image_wh, skew)
++        return all(abs(a - b) < 1e-6 for a, b in zip((*center, *size), (*fit_center, *fit_size)))
++
++    def _read_constrain(self) -> bool:
++        value = app_settings().value('crop_constrain', True)
++        return str(value).strip().lower() not in ('false', '0', 'no', 'off')
++
++    def _session_fit(self, base) -> tuple:
++        skew = float(self._widgets.scan_finishing.skew_deg.value)
++        if not self._crop_constrain or abs(skew) < 1e-9:
++            return clamp_rect(tuple(base))
++        # shrink about the frame's own centre: what the user framed stays put
++        return fit_rect_about_centre(base, skew, self._scan_frame_wh())
++
++    def _refit_session_frame(self) -> None:
++        if not self.crop_session_active() or self._frame_base_uv is None:
++            return
++        self._frame_rect_uv = self._session_fit(self._frame_base_uv)
++        if self._gpu_canvas is not None:
++            self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
++
++    def _schedule_session_render(self) -> None:
++        """The turned picture must show under the frame even with auto
++        preview off (as a drag of the angle already does), but once per
++        burst of changes: an angle typed, stepped or dragged settles first.
++        With auto preview on the field's own change already renders."""
++        if self._auto_preview_enabled():
++            return
++        timer = self._crop_session_render
++        if timer is None:
++            timer = self._crop_session_render = QtCore.QTimer()
++            timer.setSingleShot(True)
++            timer.setInterval(150)
++            timer.timeout.connect(self._session_render_due)
++        timer.start()
++
++    def _crop_flat_key(self, state, image_data):
++        """Everything a render depends on but the angle: the same key means
++        the kept unturned frame is still the film as it now is."""
++        import copy
++
++        flat_state = copy.deepcopy(state)
++        flat_state.scan_finishing.skew_deg = 0.0
++        return (id(image_data), tuple(np.shape(image_data)), flat_state)
++
++    def _crop_turn_fast_path(self, state, params, image_data, source_layer_name,
++                             mode_label) -> bool:
++        """While cropping, a preview at a new angle is the kept unturned
++        frame turned -- ~12 ms on the GPU against a render (the turn is the
++        pipeline's last step, applied to the finished scan, and the same
++        shader turns it here). True when the frame was shown here; otherwise
++        a crop's render is made unturned, to keep."""
++        self._crop_flat_pending = None
++        if (not self.crop_session_active() or source_layer_name != INPUT_PREVIEW_LAYER_NAME
++                or self._live_stock_recipe is not None):
++            return False
++        key = self._crop_flat_key(state, image_data)
++        if self._crop_flat is not None and self._crop_flat[0] == key:
++            self._show_turned(self._turned_result(
++                self._crop_flat, float(state.scan_finishing.skew_deg), mode_label))
++            return True
++        params.scanner.finishing.skew_deg = 0.0     # render the film unturned, once
++        self._crop_flat_pending = key
++        return False
++
++    def _crop_turn_result(self, result):
++        """A finished render that was a crop's unturned frame: keep it, and
++        show it turned to the angle now set."""
++        key, self._crop_flat_pending = self._crop_flat_pending, None
++        if key is None or not self.crop_session_active():
++            return result
++        # float32: the precision the screen path works in, and half the turn's cost
++        self._crop_flat = (key, np.asarray(result.float_image, dtype=np.float32),
++                           result.output_color_space, result.use_display_transform)
++        return self._turned_result(self._crop_flat,
++                                   float(self._widgets.scan_finishing.skew_deg.value),
++                                   result.mode_label, result.status_message)
++
++    def _show_turned(self, result) -> None:
++        """A turned frame onto the canvas: what showing a render does for the
++        picture. The scopes (histogram, thumbnails, curve preview) cost more
++        than the turn itself, so they follow once the turning stops."""
++        self._showing_input = False
++        self._output_display_cached = result.display_image
++        self._set_or_add_output_layer(
++            result.display_image,
++            float_image=result.float_image,
++            output_color_space=result.output_color_space,
++            output_cctf_encoding=True,
++            use_display_transform=result.use_display_transform,
++        )
++        self._show_last_render()
++        timer = self._crop_scopes_timer
++        if timer is None:
++            timer = self._crop_scopes_timer = QtCore.QTimer()
++            timer.setSingleShot(True)
++            timer.setInterval(150)
++            timer.timeout.connect(self._crop_scopes_due)
++        timer.start()
++
++    def _crop_scopes_due(self) -> None:
++        display = self._output_display_cached
++        if display is not None:
++            self._update_analysis(getattr(display, 'small', display))
++
++    def _turned_result(self, flat, angle: float, mode_label: str, status: str = ''):
++        from spektrafilm.gpu.scan_geometry import skew_dispatch
++        from spektrafilm.utils.crop_resize import apply_skew
++
++        _key, image, output_color_space, use_display_transform = flat
++        turned = image
++        if abs(angle) > 1e-9:
++            turned = skew_dispatch(image, angle)
++            if turned is None:
++                turned = apply_skew(image, angle)
++        display, display_status = self._prepare_output_display_image(
++            turned, output_color_space=output_color_space,
++            use_display_transform=use_display_transform)
++        return runtime.SimulationResult(
++            mode_label=mode_label, display_image=display, float_image=turned,
++            output_color_space=output_color_space, use_display_transform=use_display_transform,
++            status_message=status or display_status)
++
++    def _session_render_due(self) -> None:
++        if not self.crop_session_active():
++            return
++        if self._active_simulation_worker is not None or self._active_export_worker is not None:
++            self._crop_session_render.start()       # after the render in flight
++            return
++        self.request_view_refresh()
++
++    def _sync_crop_buttons(self, armed: bool) -> None:
++        """The Frame group (Cancel · Done shown, its Crop tool checked) and
++        the viewing rail's crop toggle show the session, however it was
++        opened."""
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is not None:
++            frame.set_session_open(armed)
++        button = getattr(frame, 'crop_button', None)
++        if button is not None and button.isCheckable() and button.isChecked() != armed:
++            was_blocked = button.blockSignals(True)
++            button.setChecked(armed)
++            button.blockSignals(was_blocked)
++        # The rail's toggle keeps its signals: they tint its icon. What it
++        # calls back is harmless here -- arming re-arms the open session's
++        # frame, and by the time it goes off the session has.
++        crop_button = getattr(getattr(self, '_view_rail', None), 'crop_button', None)
++        if crop_button is not None and crop_button.isChecked() != armed:
++            crop_button.setChecked(armed)
++
++    def set_crop_constrain(self, on: bool) -> None:
++        """Scan > Frame's Constrain to image: an app setting, remembered; an
++        open crop refits to it."""
++        self._crop_constrain = bool(on)
++        app_settings().setValue('crop_constrain', bool(on))
++        self._refit_session_frame()
++
++    def _reset_desqueeze(self) -> None:
++        """Desqueeze back to its baseline, as the row's own reset arrow does."""
++        editor = self._widgets.scan_finishing.desqueeze
++        reset = getattr(editor, 'reset_to_baseline', None)
++        if callable(reset):
++            reset()
++
++    def _session_reset(self) -> None:
++        """Reset inside the crop: no angle, the whole photo, Free, landscape,
++        no desqueeze -- still only on screen until Done (Cancel puts it all
++        back, desqueeze included)."""
++        self._frame_base_uv = (0.0, 0.0, 1.0, 1.0)
++        self._frame_from_straighten = False
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is not None:
++            frame.set_portrait(False)
++        self._reset_desqueeze()                 # first: it sets the photo's shape
++        self._widgets.scan_finishing.skew_deg.value = 0.0
++        combo = self._ratio_combo()
++        if combo is not None:
++            combo.setCurrentIndex(0)            # 'Free'; refits through its own signal
++        self._refit_session_frame()
++
++    def _end_crop_session(self) -> None:
++        self._crop_flat = None                  # the next render is a whole one again
++        self._crop_flat_pending = None
++        if self._crop_escape is not None and self._gpu_canvas is not None:
++            self._gpu_canvas.window().removeEventFilter(self._crop_escape)
++        if self._crop_session_render is not None:
++            self._crop_session_render.stop()
++        self._frame_base_uv = None
++        self._frame_from_straighten = False
++        self._sync_crop_buttons(False)
++
++    def _announce_crop_session(self, initial, final) -> None:
++        """Done's card: what changed, and one Undo for all of it."""
++        crop_was, center_was, size_was, skew_was = initial
++        crop_on, center, size, skew = final
++        turned = abs(skew - skew_was) > 1e-9
++        cropped = (crop_on != crop_was) or (crop_on and (
++            any(abs(a - b) > 1e-9 for a, b in zip((*center, *size), (*center_was, *size_was)))))
++        if not turned and not cropped:
++            set_status(self._viewer, 'Crop and angle unchanged')
++            return
++        if turned and abs(skew) > 1e-9:
++            title = f'Straightened {skew:.1f}°'
++            if crop_on and self._crop_constrain:
++                title += ', cropped to fit'
++        elif turned:
++            title = 'Straighten removed' + (', crop kept' if crop_on else '')
++        else:
++            title = 'Crop applied' if crop_on else 'Crop removed'
++        card = notices.system_message_sink(dialog_parent(self._viewer))
++        if card is None:
++            set_status(self._viewer, title)
++            return
++        card.show_message('pos', title, 'Undo takes back the angle and the crop together.',
++                          actions=[('Undo', self.undo)])
++
++    def _stored_crop(self, rect_uv, image_wh, skew: float):
++        """(centre, size) Done writes for the frame: the frame itself to the
++        fields' precision, nearest -- so a crop re-opened and applied again is
++        the same crop -- and moved inward only when that rounding would reach
++        past the turned photo. (Always stepping inward shrank the crop on
++        every Crop -> Done.)"""
++        center, size = rect_to_center_size(rect_uv, image_wh)
++        digits = 4
++        nearest = (tuple(round(float(v), digits) for v in center),
++                   tuple(round(float(v), digits) for v in size))
++        kept = crop_rect_uv(nearest[0], nearest[1], image_wh)
++        if rect_inside_frame(kept) and rect_fits_rotated_image(kept, skew, image_wh):
++            return nearest
++        return self._crop_inside_values(rect_uv, image_wh)
++
++    @staticmethod
++    def _crop_inside_values(rect_uv, image_wh, step: float = CROP_FIELD_STEP):
++        """(centre, size) for crop_center / crop_size such that the crop the
++        fields KEEP still lies inside the fitted rect, when rounding to
++        nearest would push the cut past it, onto the empty corners. Each size
++        is floored and given one step of room, so a centre at the fields'
++        precision inside the fitted rect always exists."""
++        width, height = max(float(image_wh[0]), 1.0), max(float(image_wh[1]), 1.0)
++        long_edge = max(width, height)
++        u0, v0, u1, v1 = rect_uv
++        center, size = [], []
++        for low, high, span in ((u0, u1, width), (v0, v1, height)):
++            fitted = (high - low) * span / long_edge                 # long-edge units
++            kept = max(step, (math.floor(round(fitted / step, 9)) - 1) * step)
++            half = kept * long_edge / span / 2.0                     # back to uv
++            lowest = math.ceil(round((low + half) / step, 9)) * step
++            highest = math.floor(round((high - half) / step, 9)) * step
++            nearest = round(((low + high) / 2.0) / step) * step
++            digits = max(0, round(-math.log10(step)))
++            center.append(round(min(max(nearest, lowest), max(lowest, highest)), digits))
++            size.append(round(kept, digits))
++        return tuple(center), tuple(size)
++
++    def _scan_frame_wh(self) -> tuple[float, float]:
++        """(width, height) of the frame the scan crop is defined in: the input
++        after its own crop, desqueezed. Only the aspect matters to the crop
++        maths. NOT the canvas texture: while a scan crop is on, the view shows
++        the CROPPED render, and fitting against its size puts the crop in the
++        wrong frame."""
++        image = getattr(self, '_current_input_image', None)
++        if image is None:
++            return self._crop_image_wh()
++        height, width = (int(v) for v in np.shape(image)[:2])
++        input_widgets = self._widgets.input_image
++        if bool(input_widgets.crop.value):
++            # spektrafilm.utils.crop_resize.crop_image: size is a fraction of
++            # the long side, capped at the image.
++            long_edge = max(height, width)
++            size_x, size_y = (float(v) for v in input_widgets.crop_size.value)
++            width = min(int(round(long_edge * size_x)), width)
++            height = min(int(round(long_edge * size_y)), height)
++        from spektrafilm.utils.crop_resize import crop_geometry_output_shape
++
++        height, width = crop_geometry_output_shape(
++            (height, width), float(self._widgets.scan_finishing.desqueeze.value))
++        return (max(float(width), 1.0), max(float(height), 1.0))
++
+     def set_crop_tool(self, mode: str) -> None:
+         """Arm or disarm the on-canvas crop tool. While armed the camera pan
+         is suspended so the drag drives the crop instead. Phase 9 modes:
+@@ -42,12 +529,25 @@
+         legacy 'draw'/'move' rubber band remains for the napari-era path."""
+         if mode in ('frame', 'line') and self._gpu_canvas is not None:
+             self._crop_tool_mode = mode
+-            if mode == 'frame':
+-                self._arm_crop_frame()
+-            else:
++            if mode == 'line':
+                 self._arm_straighten_line()
++            elif self.crop_session_active():
++                self._arm_canvas_frame()        # back to the frame, session kept
++            else:
++                self._arm_crop_frame()
++                self._sync_crop_buttons(True)
++                frame = getattr(self._widgets, 'scan_frame', None)
++                if frame is not None:
++                    frame.reveal_requested.emit()   # the crop's controls are there
+             return
+         if mode == 'off' and self._frame_rect_uv is not None:
++            if self._crop_tool_mode == 'line':
++                # Straighten toggled off inside a session without a line:
++                # back to the frame, nothing applied
++                self._crop_tool_mode = 'frame'
++                self._arm_canvas_frame()
++                self._sync_crop_buttons(True)
++                return
+             # LR semantics: toggling the crop tool off APPLIES the frame
+             self._frame_commit()
+             return
+@@ -170,75 +670,85 @@
+         """The locked aspect (width/height, converted to uv units) or None.
+         Any preset other than Free acts as the lock; Free is unlocked."""
+ 
+-        image_wh = self._crop_image_wh()
+-        text = ''
+-        section = getattr(self._widgets, 'scan_frame', None)
+-        combo = getattr(section, 'ratio_combo', None)
+-        if combo is not None:
+-            text = str(combo.currentText())
+-        ratio = parse_ratio(text, image_wh)
++        image_wh = self._scan_frame_wh()
++        ratio = self._locked_ratio(image_wh)
+         if ratio is None:
+             return None
+         width, height = image_wh
+         return ratio * height / width
+ 
+-    def _arm_crop_frame(self) -> None:
++    def _arm_crop_frame(self, initial=None) -> None:
++        """Open the session. `initial` is the state Cancel puts back when the
++        session opened on an edit that has already landed (a typed angle);
++        otherwise it is the state now."""
+         finishing_widgets = self._widgets.scan_finishing
+-        center = tuple(float(v) for v in finishing_widgets.crop_center.value)
+-        size = tuple(float(v) for v in finishing_widgets.crop_size.value)
+-        crop_active = bool(finishing_widgets.crop.value)
+-        skew = float(finishing_widgets.skew_deg.value)
+-        self._frame_initial = (crop_active, center, size, skew)
++        if initial is None:
++            self.history_flush()
++        current = self._frame_state()
++        self._frame_initial = initial if initial is not None else current
++        self._frame_initial_desqueeze = float(finishing_widgets.desqueeze.value)
++        combo = self._ratio_combo()
++        self._frame_initial_ratio = combo.currentText() if combo is not None else None
++        crop_active, center, size, _skew = current
++        image_wh = self._scan_frame_wh()
++        rect = crop_rect_uv(center, size, image_wh) if crop_active else (0.0, 0.0, 1.0, 1.0)
++        # the orientation pair shows the photo's own crop shape (and Cancel
++        # puts that back); a locked ratio follows it
++        frame = getattr(self._widgets, 'scan_frame', None)
++        self._frame_initial_portrait = (rect[3] - rect[1]) * image_wh[1] > (rect[2] - rect[0]) * image_wh[0] + 1e-6
++        if frame is not None:
++            frame.set_portrait(self._frame_initial_portrait)
++        # The frame the angle is fitted FROM. A crop only a straighten made
++        # goes back to the whole photo as the angle goes back to 0.
++        self._frame_from_straighten = self._is_straighten_crop(self._frame_initial, image_wh)
++        self._frame_base_uv = self._whole_frame_uv(image_wh) if self._frame_from_straighten else rect
++        self._crop_constrain = self._read_constrain()
++        self._frame_rect_uv = self._session_fit(self._frame_base_uv)
+         if crop_active:
+             # LR shows the WHOLE image while cropping: lift the crop and
+             # REFRESH THE VIEW EXPLICITLY (with auto preview off the editor
+             # signal renders nothing and the frame would sit over the stale
+             # cropped view — the 'crop tool not working' report).
+             finishing_widgets.crop.value = False
+-            self._frame_rect_uv = crop_rect_uv(center, size, self._crop_image_wh())
+-            self.request_view_refresh()
+-        else:
+-            self._frame_rect_uv = (0.0, 0.0, 1.0, 1.0)
++        self._arm_canvas_frame()
++        if self._crop_escape is None:
++            self._crop_escape = _EscapeCancelsCrop(lambda: self.cancel_crop_session())
++        self._gpu_canvas.window().installEventFilter(self._crop_escape)
++        self._schedule_session_render()
++        # The how-to is the rail button's tooltip: the status line has ~118 px
++        # at the smallest window, and an instruction there is cut mid-word.
++        set_status(self._viewer, 'Cropping', timeout_ms=0)
++
++    def _arm_canvas_frame(self) -> None:
+         self._gpu_canvas.arm_crop_tool(
+             'frame',
+             on_frame_drag=self._frame_dragged,
+             on_frame_release=self._frame_drag_released,
+             on_frame_commit=self._frame_commit,
+-            on_frame_cancel=self._frame_cancel,
++            on_frame_cancel=self.cancel_crop_session,
+             on_skew_start=self._skew_drag_started,
+             on_skew=self._skew_dragged,
+             on_skew_release=self._skew_drag_released,
+         )
+         self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+         self._follow_skew_on_ruler()
+-        set_status(self._viewer,
+-                   'Crop: drag handles to resize, drag inside to move the frame, '
+-                   'drag outside the picture to straighten (Shift = fine) - '
+-                   'Enter/double-click applies, Esc cancels',
+-                   timeout_ms=0)
+ 
+     def _skew_drag_started(self) -> None:
+         if self._frame_rect_uv is None:
+             return
+-        self._skew_drag_state = [float(self._widgets.scan_finishing.skew_deg.value),
+-                                 tuple(self._frame_rect_uv)]
++        self._skew_drag_state = [float(self._widgets.scan_finishing.skew_deg.value)]
+ 
+     def _skew_dragged(self, delta_deg: float, fine: bool) -> None:
+-        """Turn the image by the pointer's turn about the picture's centre,
+-        and fit the crop inside the turned image. The fit starts from the
+-        frame as it was at the PRESS, so turning back within one drag gives
+-        the frame back rather than leaving it shrunk, and shrinks it about
+-        its own centre, so it stays where the user put it."""
++        """Turn the image by the pointer's turn about the picture's centre.
++        The field's change refits the frame from the session's base frame, so
++        turning back gives the frame back rather than leaving it shrunk."""
+ 
+         state = self._skew_drag_state
+         if state is None or self._frame_rect_uv is None:
+             return
+         state[0] += float(delta_deg) * (self.SKEW_FINE_FACTOR if fine else 1.0)
+         state[0] = max(min(state[0], 45.0), -45.0)
+-        skew = round(state[0], 2)
+-        self._frame_rect_uv = fit_rect_about_centre(state[1], skew, self._crop_image_wh())
+-        self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+-        self._widgets.scan_finishing.skew_deg.value = skew
++        self._widgets.scan_finishing.skew_deg.value = round(state[0], 1)
+ 
+     def _skew_drag_released(self) -> None:
+         if self._skew_drag_state is None:
+@@ -247,16 +757,13 @@
+         # the turned picture must show even with auto preview off (the field
+         # change alone renders nothing then), as arming the frame does
+         self.request_view_refresh()
+-        set_status(self._viewer,
+-                   f'Straightened: skew {float(self._widgets.scan_finishing.skew_deg.value):+.2f} deg')
++        set_status(self._viewer, 'Cropping', timeout_ms=0)
+ 
+     def _frame_dragged(self, hit: str, du: float, dv: float, fine: bool) -> None:
+         """A handle (or the frame) held and moved. Tracked from where the
+         drag started, as Lightroom's is: only what is held moves, it stops
+         where it meets the picture's edge, and it follows the pointer again
+-        once the pointer comes back. (It used to fit the dragged frame into
+-        the turned picture -- d-controller-257 -- which slid and shrank it,
+-        moving the edges the user was not holding.)"""
++        once the pointer comes back."""
+         if self._frame_rect_uv is None:
+             return
+         factor = 0.2 if fine else 1.0
+@@ -267,6 +774,9 @@
+         total[1] += dv * factor
+         rect = self._held_frame(hit, start, total[0], total[1])
+         self._frame_rect_uv = rect
++        # what the user set is what later angles are fitted from
++        self._frame_base_uv = rect
++        self._frame_from_straighten = False
+         self._gpu_canvas.set_crop_frame(rect)
+ 
+     def _frame_drag_released(self) -> None:
+@@ -274,10 +784,10 @@
+ 
+     def _held_frame(self, hit: str, start, du: float, dv: float):
+         """The frame `start` with `hit` dragged by (du, dv), as far as it can
+-        go inside the turned picture."""
++        go inside the picture (the turned picture with Constrain on)."""
+         ratio = self._frame_ratio_uv() if hit != 'inside' else None
+         skew = float(self._widgets.scan_finishing.skew_deg.value)
+-        image_wh = self._crop_image_wh()
++        image_wh = self._scan_frame_wh()
+ 
+         def at(du_, dv_):
+             if hit == 'inside':                 # the frame follows the pointer
+@@ -286,11 +796,12 @@
+             return resize_rect(start, hit, du_, dv_, ratio_uv=ratio, clamp=False)
+ 
+         def fits(rect):
+-            return rect_inside_frame(rect) and rect_fits_rotated_image(rect, skew, image_wh)
++            return rect_inside_frame(rect) and (
++                not self._crop_constrain or rect_fits_rotated_image(rect, skew, image_wh))
+ 
+-        if not fits(start):                     # (a frame from before the angle)
++        if not fits(start):                     # (a stored crop from before the angle)
+             rect = resize_rect(start, hit, du, dv, ratio_uv=ratio) if hit != 'inside' else start
+-            return fit_rect_about_centre(rect, skew, image_wh)
++            return fit_rect_about_centre(rect, skew, image_wh) if self._crop_constrain else rect
+         if ratio is not None and len(hit) == 2:
+             # a corner on a locked ratio: both axes move together
+             t = furthest_drag(lambda t: at(t * du, t * dv), fits)
+@@ -301,134 +812,173 @@
+         tv = furthest_drag(lambda t: at(tu * du, t * dv), fits)
+         return at(tu * du, tv * dv)
+ 
+-    def _frame_commit(self) -> None:
++    def _frame_commit(self, *, announce: bool = True, refresh: bool = True,
++                      message: str | None = None) -> None:
++        """Done (the bar, Enter, double-click, the Crop tool toggled off, or
++        leaving the photo): apply the angle and the crop as ONE undo step."""
+         if self._frame_rect_uv is None:
+             return
+         u0, v0, u1, v1 = self._frame_rect_uv
+         # full frame is judged on the uv spans (the persisted size is
+         # long-edge-normalized, so a full-frame short axis is < 1.0)
+         full_frame = (u1 - u0) >= 0.999 and (v1 - v0) >= 0.999
+-        center, size = rect_to_center_size(self._frame_rect_uv, self._crop_image_wh())
++        image_wh = self._scan_frame_wh()
+         finishing_widgets = self._widgets.scan_finishing
+-        finishing_widgets.crop_center.value = (
+-            min(max(center[0], 0.0), 1.0), min(max(center[1], 0.0), 1.0))
+-        finishing_widgets.crop_size.value = (
+-            min(max(size[0], MIN_CROP_SIZE), 1.0), min(max(size[1], MIN_CROP_SIZE), 1.0))
++        skew = float(finishing_widgets.skew_deg.value)
++        if full_frame:
++            pass                                # crop off: its fields are inert, leave them
++        elif self._crop_constrain and abs(skew) > 1e-9:
++            # what the fields keep must stay inside the turned photo
++            center, size = self._stored_crop(self._frame_rect_uv, image_wh, skew)
++        else:
++            center, size = rect_to_center_size(self._frame_rect_uv, image_wh)
++            center = (min(max(center[0], 0.0), 1.0), min(max(center[1], 0.0), 1.0))
++            size = (min(max(size[0], MIN_CROP_SIZE), 1.0), min(max(size[1], MIN_CROP_SIZE), 1.0))
++        if not full_frame:
++            finishing_widgets.crop_center.value = center
++            finishing_widgets.crop_size.value = size
+         finishing_widgets.crop.value = not full_frame
++        initial = self._frame_initial
+         self._frame_rect_uv = None
+         self._frame_initial = None
++        self._frame_initial_ratio = None
++        self._frame_initial_desqueeze = None
++        self._end_crop_session()
+         self._finish_crop_tool(
+-            'Scan crop applied' if not full_frame else 'Full frame - crop off')
+-
+-    def _frame_cancel(self) -> None:
+-        finishing_widgets = self._widgets.scan_finishing
+-        if self._frame_initial is not None:
+-            crop_active, center, size, skew = self._frame_initial
++            message or ('Scan crop applied' if not full_frame else 'Full frame - crop off'),
++            refresh=refresh)
++        self.history_flush()                    # the session's one undo step
++        if initial is not None and announce:
++            self._announce_crop_session(initial, self._frame_state())
++
++    def _frame_cancel(self, reason: str = '', *, refresh: bool = True) -> None:
++        """Cancel (Esc, undo, a turn of the photo): the photo exactly as
++        before the session -- angle, crop, ratio, orientation, desqueeze."""
++        initial = self._frame_initial
++        ratio = self._frame_initial_ratio
++        desqueeze = self._frame_initial_desqueeze
++        # out of the session FIRST: what goes back below is not a session
++        # change (it would refit and render the half-restored state)
++        self._frame_rect_uv = None
++        self._frame_initial = None
++        self._frame_initial_ratio = None
++        self._frame_initial_desqueeze = None
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is not None:
++            frame.set_portrait(self._frame_initial_portrait)
++        finishing = self._widgets.scan_finishing
++        if desqueeze is not None and abs(float(finishing.desqueeze.value) - desqueeze) > 1e-9:
++            finishing.desqueeze.value = desqueeze
++        if initial is not None:
++            crop_active, center, size, skew = initial
++            finishing_widgets = self._widgets.scan_finishing
+             finishing_widgets.crop_center.value = center
+             finishing_widgets.crop_size.value = size
+-            finishing_widgets.skew_deg.value = skew     # a turn made in the tool too
++            with self._angle_put_back() as editor:
++                editor.value = skew                 # a turn made in the tool too
+             finishing_widgets.crop.value = crop_active
+-        self._frame_rect_uv = None
+-        self._frame_initial = None
+-        self._finish_crop_tool('Crop cancelled - previous crop restored')
++        if ratio is not None and frame is not None:
++            frame.show_ratio(ratio)
++        self._end_crop_session()
++        self._finish_crop_tool(reason or 'Crop cancelled', refresh=refresh)
+ 
+     def refit_crop_to_ratio(self) -> None:
+-        """Ratio preset selected while the frame is armed: re-fit the frame
+-        to the new aspect (centered, max-fit)."""
++        """A ratio picked in Scan > Frame: the frame refits to it (centred,
++        as large as fits). A pick with no crop open opens one, so the pick
++        shows and Cancel puts the old ratio back."""
+ 
+-        if self._frame_rect_uv is None or self._gpu_canvas is None:
+-            return
+-        image_wh = self._crop_image_wh()
+-        section = getattr(self._widgets, 'scan_frame', None)
+-        combo = getattr(section, 'ratio_combo', None)
+-        text = str(combo.currentText()) if combo is not None else ''
+-        ratio = parse_ratio(text, image_wh)
+-        self._frame_rect_uv = refit_to_ratio(self._frame_rect_uv, ratio, image_wh)
+-        self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
++        if self._frame_rect_uv is None:
++            if not self._crop_session_allowed():
++                return
++            self._open_crop_session()
++            frame = getattr(self._widgets, 'scan_frame', None)
++            if frame is not None:
++                self._frame_initial_ratio = frame.previous_ratio
++        image_wh = self._scan_frame_wh()
++        self._frame_base_uv = refit_to_ratio(self._frame_base_uv or self._frame_rect_uv,
++                                             self._locked_ratio(image_wh), image_wh)
++        self._frame_from_straighten = False
++        self._refit_session_frame()
++
++    def _orientation_chosen(self, portrait: bool) -> None:
++        """Scan > Frame's landscape / portrait pair asked for a turn; opens
++        the crop when it is not open."""
++        if self._frame_rect_uv is None:
++            if not self._crop_session_allowed():
++                return
++            self._open_crop_session()           # the pair now shows the frame's shape
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is not None and frame.portrait() == bool(portrait):
++            return                              # the frame is that way already
++        self.swap_crop_orientation()
+ 
+     def swap_crop_orientation(self) -> None:
+-        """The Frame section's Swap: landscape <-> portrait, LR-style — the
+-        crop's pixel dimensions swap (shrinking uniformly only when the
+-        swapped shape no longer fits), and a locked ratio preset flips to its
+-        counterpart (16:9 -> 9:16) so further handle drags stay consistent."""
++        """Landscape <-> portrait, LR-style: the frame's pixel dimensions
++        swap (shrinking only when the swapped shape no longer fits) and a
++        locked ratio turns with it (3:2 becomes 2:3). Opens the crop when it
++        is not open."""
+ 
+-        section = getattr(self._widgets, 'scan_frame', None)
+-        combo = getattr(section, 'ratio_combo', None)
+-        if combo is not None:
+-            swapped_label = swap_ratio_label(combo.currentText())
+-            index = combo.findText(swapped_label)
+-            if index >= 0 and index != combo.currentIndex():
+-                was_blocked = combo.blockSignals(True)   # keep our size-preserving swap
+-                combo.setCurrentIndex(index)
+-                combo.blockSignals(was_blocked)
+-        image_wh = self._crop_image_wh() if self._gpu_canvas is not None else (1.0, 1.0)
+-        if self._frame_rect_uv is not None and self._gpu_canvas is not None:
+-            self._frame_rect_uv = swap_rect_orientation(self._frame_rect_uv, image_wh)
+-            self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+-            set_status(self._viewer, 'Crop frame orientation swapped')
+-            return
+-        finishing_widgets = self._widgets.scan_finishing
+-        if not bool(finishing_widgets.crop.value):
+-            set_status(self._viewer, 'No crop to swap - arm the Crop tool or set a crop first')
+-            return
+-        center = tuple(float(v) for v in finishing_widgets.crop_center.value)
+-        size = tuple(float(v) for v in finishing_widgets.crop_size.value)
+-        rect = swap_rect_orientation(crop_rect_uv(center, size, image_wh), image_wh)
+-        new_center, new_size = rect_to_center_size(rect, image_wh)
+-        finishing_widgets.crop_center.value = new_center
+-        finishing_widgets.crop_size.value = new_size
+-        set_status(self._viewer, 'Crop orientation swapped')
+-        self.request_view_refresh()
++        if self._frame_rect_uv is None:
++            if not self._crop_session_allowed():
++                return
++            self._open_crop_session()
++        frame = getattr(self._widgets, 'scan_frame', None)
++        image_wh = self._scan_frame_wh()
++        self._frame_base_uv = swap_rect_orientation(
++            self._frame_base_uv or self._frame_rect_uv, image_wh)
++        self._frame_from_straighten = False
++        if frame is not None:
++            u0, v0, u1, v1 = self._frame_base_uv
++            frame.set_portrait((v1 - v0) * image_wh[1] > (u1 - u0) * image_wh[0] + 1e-6)
++        self._refit_session_frame()
+ 
+     def reset_crop(self) -> None:
+-        """The Frame section's Reset: back to the ORIGINAL photo format —
+-        full frame, ratio Free. Works on the armed frame or the persisted
+-        crop directly (view refreshed either way)."""
+-        section = getattr(self._widgets, 'scan_frame', None)
+-        combo = getattr(section, 'ratio_combo', None)
+-        if combo is not None:
+-            was_blocked = combo.blockSignals(True)
+-            combo.setCurrentIndex(0)            # 'Free'
+-            combo.blockSignals(was_blocked)
+-        if self._frame_rect_uv is not None and self._gpu_canvas is not None:
+-            self._frame_rect_uv = (0.0, 0.0, 1.0, 1.0)
+-            self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+-            set_status(self._viewer, 'Crop frame reset to the full photo')
++        """Scan > Frame's Reset (and the group's header reset): the photo as
++        it was shot -- no crop, no angle, ratio Free, landscape, no
++        desqueeze: everything in the group -- as one undo step. Inside the
++        crop it resets the crop, still only on screen until Done."""
++        if self.crop_session_active():
++            self._session_reset()               # one Reset, whichever button
+             return
++        self.history_flush()                    # what came before stays its own step
++        section = getattr(self._widgets, 'scan_frame', None)
++        if section is not None:
++            section.show_ratio('Free')
++            section.set_portrait(False)
++        self._reset_desqueeze()
+         finishing_widgets = self._widgets.scan_finishing
+         finishing_widgets.crop.value = False
+         finishing_widgets.crop_center.value = (0.5, 0.5)
+         finishing_widgets.crop_size.value = (1.0, 1.0)
+-        set_status(self._viewer, 'Crop reset to the original photo format')
++        with self._angle_put_back() as editor:
++            editor.value = 0.0
++        self.history_flush()
++        set_status(self._viewer, 'Frame reset')
+         self.request_view_refresh()
+ 
+     # -- Phase 9: straighten line --------------------------------------------
+     def _arm_straighten_line(self) -> None:
+         self._gpu_canvas.arm_crop_tool('line', on_line=self._straighten_line_drawn)
+-        set_status(self._viewer,
+-                   'Straighten: drag a line along a horizon or vertical', timeout_ms=0)
++        set_status(self._viewer, 'Straighten', timeout_ms=0)
+ 
+     def _straighten_line_drawn(self, x0: float, y0: float, x1: float, y1: float) -> None:
+         angle = angle_from_line(x0, y0, x1, y1)
+         finishing_widgets = self._widgets.scan_finishing
+         current = float(finishing_widgets.skew_deg.value)
+         new_skew = max(min(current + angle, 45.0), -45.0)
+-        finishing_widgets.skew_deg.value = round(new_skew, 2)
+-        # 2026-09-19; see design/DECISIONS.md#d-controller-258
+-        image_wh = self._crop_image_wh()
+-        if self._frame_rect_uv is not None:
+-            self._frame_rect_uv = fit_rect_about_centre(
+-                self._frame_rect_uv, new_skew, image_wh)
+-            self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+-        elif bool(finishing_widgets.crop.value):
+-            center = tuple(float(v) for v in finishing_widgets.crop_center.value)
+-            size = tuple(float(v) for v in finishing_widgets.crop_size.value)
+-            rect = fit_rect_about_centre(
+-                crop_rect_uv(center, size, image_wh), new_skew, image_wh)
+-            new_center, new_size = rect_to_center_size(rect, image_wh)
+-            finishing_widgets.crop_center.value = new_center
+-            finishing_widgets.crop_size.value = new_size
+-        self._finish_crop_tool(f'Straightened {angle:+.2f} deg (skew {new_skew:+.2f})')
++        # The angle goes IN the crop session, so the frame refits to keep the
++        # corners out and nothing applies until Done. (It used to set the
++        # angle alone -- d-controller-258 -- and with no crop on, the photo
++        # kept four smeared corners.)
++        self._widgets.scan_frame.release_tools()     # the line has done its job
++        if self.crop_session_active():
++            self._crop_tool_mode = 'frame'
++            self._arm_canvas_frame()                 # back to the frame's handles
++        else:
++            self._open_crop_session()       # from the photo as it is: Cancel restores it
++        finishing_widgets.skew_deg.value = round(new_skew, 1)    # the session refits
++        self._sync_crop_buttons(True)
++        set_status(self._viewer, 'Cropping', timeout_ms=0)
+ 
+     def _set_camera_interactive(self, interactive: bool) -> None:
+         # napari >= 0.5 splits camera interaction into mouse_pan / mouse_zoom
+@@ -568,13 +1118,15 @@
+         if layer is not None:
+             self._viewer.layers.remove(layer)
+ 
+-    def _finish_crop_tool(self, message: str) -> None:
++    def _finish_crop_tool(self, message: str, *, refresh: bool = True) -> None:
+         self._widgets.scan_frame.release_tools()
+         self.set_crop_tool('off')
+         set_status(self._viewer, message)
+         # Crop/straighten results are VIEW changes: render them even when
+-        # auto preview is off (same rule as the scan-film toggle).
+-        self.request_view_refresh()
++        # auto preview is off (same rule as the scan-film toggle) -- unless a
++        # load that renders anyway follows (a frame switch).
++        if refresh:
++            self.request_view_refresh()
+ 
+     def mirror_input_image_horizontal(self) -> None:
+         """Mirror the source image left-right (like the NegPy flip-H toggle;
+@@ -589,6 +1141,8 @@
+         input_image = self._current_input_image
+         if input_image is None:
+             return
++        self.cancel_crop_session('Crop cancelled (photo mirrored)',
++                                 refresh=False)
+         data = np.asarray(input_image)
+         mirrored = np.ascontiguousarray(np.flip(data, axis=axis))
+         self._update_preview_cache(
+--- a/src/spektrafilm_gui/crop_frame.py
++++ b/src/spektrafilm_gui/crop_frame.py
+@@ -20,12 +20,12 @@
+ MIN_CROP_SIZE = 0.04
+ HANDLE_RADIUS_PX = 8.0
+ 
+-# Ratio presets: the historical set + Original + Cinema + Vertical/social.
++# Ratio presets: the historical set + Original + Cinema. Each ratio once:
++# the Frame group's landscape / portrait pair gives the portrait version.
+ RATIO_PRESETS = (
+     'Free', 'Original',
+     '3:2', '4:3', '5:4', '6:7', '1:1', '65:24',
+     '16:9', '1.85:1', '2.39:1',                    # Cinema
+-    '4:5', '9:16', '2:3', '3:4', '7:6', '24:65',   # Vertical / social
+ )
+ 
+ 
+@@ -251,21 +251,15 @@
+     return clamp_rect(rect, (MIN_CROP_SIZE, MIN_CROP_SIZE))
+ 
+ 
+-# W:H <-> H:W counterparts inside RATIO_PRESETS (symmetric map); presets
+-# without a listed counterpart (1:1, Free, Original, 1.85:1, 2.39:1) keep
+-# their label on swap.
+-_RATIO_SWAP = {
+-    '3:2': '2:3', '4:3': '3:4', '5:4': '4:5', '6:7': '7:6',
+-    '65:24': '24:65', '16:9': '9:16',
+-}
+-_RATIO_SWAP.update({v: k for k, v in _RATIO_SWAP.items()})
+-
+-
+-def swap_ratio_label(text: str) -> str:
+-    """The swapped counterpart of a ratio preset label ('16:9' -> '9:16'),
+-    case-insensitive; labels without a counterpart pass through."""
+-    label = (text or '').strip()
+-    return _RATIO_SWAP.get(label.lower(), label)
++def oriented_ratio(ratio, portrait: bool):
++    """A width/height ratio turned to the frame's orientation: at most 1 in
++    portrait, at least 1 in landscape (3:2 is 2:3 in portrait). None stays
++    None (Free)."""
++    if not ratio:
++        return ratio
++    if (ratio > 1.0) == bool(portrait) and abs(ratio - 1.0) > 1e-9:
++        return 1.0 / ratio
++    return ratio
+ 
+ 
+ # ------------------------------------------------------------- straighten
+@@ -374,8 +368,8 @@
+     """True when the rect lies inside the turned picture: each corner,
+     turned back about the centre as `fit_rect_in_rotated_image` turns it,
+     lands inside W x H less the same inset. Tested exactly, corner by
+-    corner -- comparing with a re-fit is off by the fit's own rounding right
+-    at the edge, which would refuse drags that keep a corner there."""
++    corner -- comparing with a re-fit was off by the fit's own rounding
++    right at the edge, which refused drags that kept a corner there."""
+     if abs(float(skew_deg)) < 1e-9:
+         return rect_inside_frame(rect_uv)
+     width, height = max(float(image_wh[0]), 1.0), max(float(image_wh[1]), 1.0)
+--- a/src/spektrafilm_gui/scan_sections.py
++++ b/src/spektrafilm_gui/scan_sections.py
+@@ -8,7 +8,7 @@
+ 
+ from qtpy import QtCore, QtWidgets
+ 
+-from spektrafilm_gui.crop_frame import parse_ratio, RATIO_PRESETS
++from spektrafilm_gui.crop_frame import oriented_ratio, parse_ratio, RATIO_PRESETS
+ from spektrafilm_gui.curve_widget import CurveEditorView
+ from spektrafilm_gui.state import (InputGamutCompressState, OutputGamutCompressState,
+                                    ScanFinishingState)
+@@ -36,6 +36,15 @@
+     crop_reset_requested = Signal()              # back to the original photo format
+     orientation_swap_requested = Signal()        # landscape <-> portrait (LR's X)
+     ratio_changed = Signal(str)                  # preset picked (re-fit armed frame)
++    # the crop session's controls, which live in this group (Cancel · Done,
++    # Constrain to image, the orientation pair); the controller applies them
++    crop_cancel_requested = Signal()
++    crop_done_requested = Signal()
++    constrain_toggled = Signal(bool)
++    orientation_chosen = Signal(bool)            # True = portrait
++    session_open_changed = Signal(bool)          # Cancel · Done show while cropping
++    reveal_requested = Signal()                  # show this group (cropping began elsewhere)
++    display_changed = Signal()                   # ratio or orientation set without a pick
+ 
+     # Phase 9 presets: the historical set + Original + Cinema + Vertical/social
+     # (defined once in crop_frame.RATIO_PRESETS).
+@@ -58,7 +67,10 @@
+             'Aspect preset. Anything but Free LOCKS the crop frame to the ratio '
+             '(handle drags stay constrained); picking a preset re-fits the frame. '
+             'Original = the image\'s own aspect.'))
+-        self.ratio_combo.currentTextChanged.connect(self.ratio_changed.emit)
++        # the ratio before the last pick, so a crop the pick opened can put it back
++        self.previous_ratio = self.ratio_combo.currentText()
++        self._ratio_text = self.previous_ratio
++        self.ratio_combo.currentTextChanged.connect(self._ratio_picked)
+ 
+         # Phase 9: ONE persistent Lightroom-style crop tool (replaces the old
+         # draw-then-move pair) + a straighten-line tool + a crop reset.
+@@ -74,8 +86,8 @@
+         self.straighten_button.setProperty('role', 'compactAction')
+         self.straighten_button.setToolTip(_normalize_ui_text(
+             'Drag a line along a horizon or vertical on the image; the skew angle is set '
+-            'so the line comes out level, and the crop auto-shrinks to stay inside the '
+-            'rotated image.'))
++            'so the line comes out level, and the crop session opens with the frame '
++            'fitted inside the rotated image (Done applies both).'))
+         self.straighten_button.setCheckable(True)
+         self.reset_button = QPushButton(_normalize_ui_text('Reset'))
+         self.reset_button.setProperty('role', 'compactAction')
+@@ -91,6 +103,79 @@
+         self.swap_button.clicked.connect(self.orientation_swap_requested.emit)
+         self.crop_button.toggled.connect(lambda on: self._on_tool_toggled('frame', on))
+         self.straighten_button.toggled.connect(lambda on: self._on_tool_toggled('line', on))
++        from spektrafilm_gui.dyeworks_buttons import ToggleSwitch
++        from spektrafilm_gui.dyeworks_icons import dyeworks_icon
++        from spektrafilm_gui.theme_palette import (BORDER_LINE, BORDER_LINE_STRONG, CONTROL_BG,
++                                                   CONTROL_BG_HOVER, TEXT_BRIGHT, TEXT_SOFT)
++        from qtpy import QtGui
++
++        # the same command as the viewing rail's crop button, with a name
++        self.crop_button.setIcon(dyeworks_icon('crop', TEXT_BRIGHT))
++        self.crop_button.setToolTip(_normalize_ui_text(
++            'Crop & straighten: drag the handles to resize, inside to move, outside '
++            'the photo to turn (Shift = fine). Click again to apply.'))
++        self.straighten_button.setIcon(dyeworks_icon('straighten', TEXT_BRIGHT))
++        self.straighten_button.setToolTip(_normalize_ui_text(
++            'Draw a line along a horizon or a vertical; the angle is set so it '
++            'comes out level.'))
++        self.reset_button.setToolTip(_normalize_ui_text(
++            'Everything in Frame back: the whole photo, 0°, Free, no desqueeze. One undo step.'))
++        self.cancel_button = QPushButton(_normalize_ui_text('Cancel  Esc'))
++        self.cancel_button.setProperty('role', 'compactAction')
++        self.cancel_button.setToolTip(_normalize_ui_text(
++            'Leave the photo exactly as it was before (Esc)'))
++        self.cancel_button.clicked.connect(self.crop_cancel_requested.emit)
++        self.done_button = QPushButton(_normalize_ui_text('Done  ↵'))
++        self.done_button.setProperty('role', 'compactAction')
++        self.done_button.setToolTip(_normalize_ui_text(
++            'Apply the angle and the crop as one undo step (Enter)'))
++        self.done_button.clicked.connect(self.crop_done_requested.emit)
++        self.constrain_toggle = ToggleSwitch()
++        self.constrain_toggle.setChecked(True)
++        self.constrain_toggle.setToolTip(_normalize_ui_text(
++            'On: the frame stays inside the turned photo. Off: the frame may '
++            'include the corners, which come out white.'))
++        self.constrain_toggle.toggled.connect(self.constrain_toggled.emit)
++        # landscape / portrait, at the right end of the aspect ratio row
++        self.orientation_toggle = QWidget()
++        pair = QHBoxLayout(self.orientation_toggle)
++        pair.setContentsMargins(0, 0, 0, 0)
++        pair.setSpacing(0)
++        group = QtWidgets.QButtonGroup(self.orientation_toggle)
++        group.setExclusive(True)
++        # the app's segmented look (theme_styles `.segrow`), which the sheet
++        # only gives push buttons: CONTROL_BG, and checked a lighter fill,
++        # the strong line and a bright glyph
++        cell = ('QToolButton {{ border: 1px solid {line}; background: {bg}; padding: 0px; {corners} }}'
++                'QToolButton:hover {{ background: {on}; }}'
++                'QToolButton:checked {{ background: {on}; border: 1px solid {strong}; }}')
++        self.landscape_button = QtWidgets.QToolButton()
++        self.portrait_button = QtWidgets.QToolButton()
++        for button, glyph, tip, corners in (
++                (self.landscape_button, 'landscape', 'Landscape',
++                 'border-top-left-radius: 6px; border-bottom-left-radius: 6px;'),
++                (self.portrait_button, 'portrait', 'Portrait',
++                 'border-top-right-radius: 6px; border-bottom-right-radius: 6px; border-left: 0px;')):
++            button.setCheckable(True)
++            button.setFixedSize(26, 24)
++            icon = QtGui.QIcon()
++            icon.addPixmap(dyeworks_icon(glyph, TEXT_SOFT).pixmap(28, 28),
++                           QtGui.QIcon.Normal, QtGui.QIcon.Off)
++            icon.addPixmap(dyeworks_icon(glyph, TEXT_BRIGHT).pixmap(28, 28),
++                           QtGui.QIcon.Normal, QtGui.QIcon.On)
++            button.setIcon(icon)
++            button.setIconSize(QtCore.QSize(14, 14))
++            button.setToolTip(_normalize_ui_text(tip))
++            button.setAccessibleName(tip)
++            button.setCursor(QtCore.Qt.PointingHandCursor)
++            button.setStyleSheet(cell.format(line=BORDER_LINE, bg=CONTROL_BG, on=CONTROL_BG_HOVER,
++                                             strong=BORDER_LINE_STRONG, corners=corners))
++            group.addButton(button)
++            pair.addWidget(button)
++        self._portrait_shown = False
++        self.landscape_button.setChecked(True)
++        self.landscape_button.clicked.connect(lambda: self._orientation_clicked(False))
++        self.portrait_button.clicked.connect(lambda: self._orientation_clicked(True))
+ 
+         # Phase 18F: the ratio SELECTOR takes its own line and the four
+         # actions sit under it as the design's `.quad` (four equal columns).
+@@ -109,6 +194,15 @@
+         quad_container = QWidget()
+         quad_container.setLayout(quad)
+         tool_column.addWidget(quad_container)
++        session_row = QHBoxLayout()
++        session_row.setContentsMargins(0, 0, 0, 0)
++        session_row.setSpacing(6)
++        for widget in (self.constrain_toggle, self.orientation_toggle,
++                       self.cancel_button, self.done_button):
++            session_row.addWidget(widget)
++        session_container = QWidget()
++        session_container.setLayout(session_row)
++        tool_column.addWidget(session_container)
+         tool_container = QWidget()
+         tool_container.setLayout(tool_column)
+         tool_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+@@ -137,6 +231,44 @@
+         elif not (self.crop_button.isChecked() or self.straighten_button.isChecked()):
+             self.tool_changed.emit('off')
+ 
++    def _ratio_picked(self, text: str) -> None:
++        self.previous_ratio, self._ratio_text = self._ratio_text, text
++        self.ratio_changed.emit(text)
++
++    def show_ratio(self, text: str) -> None:
++        """Set the ratio without asking for a refit (Cancel, Reset put one
++        back), keeping `previous_ratio` in step."""
++        was_blocked = self.ratio_combo.blockSignals(True)
++        self.ratio_combo.setCurrentText(text)
++        self.ratio_combo.blockSignals(was_blocked)
++        self._ratio_text = self.ratio_combo.currentText()
++        self.display_changed.emit()
++
++    def portrait(self) -> bool:
++        return self._portrait_shown
++
++    def set_portrait(self, portrait: bool) -> None:
++        """Show the frame's orientation (no signal: it reports, not asks)."""
++        self._portrait_shown = bool(portrait)
++        (self.portrait_button if portrait else self.landscape_button).setChecked(True)
++        self.display_changed.emit()
++
++    def _orientation_clicked(self, portrait: bool) -> None:
++        # The frame decides what the pair shows: put it back, and ask. The
++        # controller turns the frame and shows its new shape.
++        shown = self._portrait_shown
++        self.set_portrait(shown)
++        if portrait != shown:
++            self.orientation_chosen.emit(portrait)
++
++    def set_constrain(self, on: bool) -> None:
++        was_blocked = self.constrain_toggle.blockSignals(True)
++        self.constrain_toggle.setChecked(bool(on))
++        self.constrain_toggle.blockSignals(was_blocked)
++
++    def set_session_open(self, open_: bool) -> None:
++        self.session_open_changed.emit(bool(open_))
++
+     def release_tools(self) -> None:
+         for button in (self.crop_button, self.straighten_button):
+             button.blockSignals(True)
+@@ -144,9 +276,10 @@
+             button.blockSignals(False)
+ 
+     def aspect_ratio(self) -> float | None:
+-        """Numeric ratio of the selected preset (None for Free/Original —
+-        Original needs the image size, resolved controller-side)."""
+-        return parse_ratio(self.ratio_combo.currentText())
++        """Numeric ratio of the selected preset in the chosen orientation
++        (None for Free/Original — Original needs the image size, resolved
++        controller-side)."""
++        return oriented_ratio(parse_ratio(self.ratio_combo.currentText()), self.portrait())
+ 
+ 
+ class ScanFinishingSection(DataclassSection):
+--- a/src/spektrafilm_gui/edit_panel.py
++++ b/src/spektrafilm_gui/edit_panel.py
+@@ -816,6 +816,8 @@
+                 section.add(NoteRule(group.note))
+             body_layout.addWidget(section)
+             self._groups.append((group, section))
++            if group.name == 'Frame':
++                self._wire_frame_group(section)
+ 
+         if stage.key == 'main':
+             # 2026-08-03; see design/DECISIONS.md#d-edit_panel-500
+@@ -865,7 +867,12 @@
+                 # the page's big `.select` (icon, name, caption), not a labelled chip (case 03)
+                 from spektrafilm_gui.dyeworks_widgets import RatioSelect
+ 
+-                section.add(RatioSelect(widget))
++                frame = getattr(self._widgets, 'scan_frame', None)
++                chip = RatioSelect(widget, trailing=getattr(frame, 'orientation_toggle', None),
++                                   portrait=getattr(frame, 'portrait', None))
++                if frame is not None:
++                    frame.display_changed.connect(chip.refresh)
++                section.add(chip)
+                 return
+             if widget is not None:
+                 label = _WIDGET_ROW_LABELS.get(row) or _label_for(row)
+@@ -1440,6 +1447,55 @@
+     #: 1.8, 2.0 -- that the control exists for.
+     DESQUEEZE_TRAVEL = (1.0, 2.0)
+ 
++    def _special_constrain(self, _options: dict):
++        """Constrain to image: an app setting rather than a stored field, so
++        the row carries the Frame section's own switch, on the label's line
++        as a boolean row's switch sits."""
++        toggle = getattr(getattr(self._widgets, 'scan_frame', None), 'constrain_toggle', None)
++        if toggle is None:
++            self.missing['special'].append('constrain')
++            return None
++        row = LabelledRow('Constrain to image')
++        row.row = 'scan_frame.constrain'
++        head = row.layout().itemAt(0).widget().layout()
++        head.insertWidget(head.count() - 1, toggle)
++        row.value.setVisible(False)
++        row.setToolTip(toggle.toolTip())
++        return row
++
++    def _wire_frame_group(self, section) -> None:
++        """The Frame group is the crop's home, so two things route to it:
++        its header reset is the group's Reset (crop and angle together, one
++        undo step) rather than each row's own reset, and cropping begun from
++        the rail shows this group."""
++        frame = getattr(self._widgets, 'scan_frame', None)
++        if frame is None:
++            return
++
++        def reset() -> None:
++            frame.reset_button.click()
++            section.schedule_recount()
++
++        section.reset_group = reset
++        frame.reveal_requested.connect(lambda: self._reveal_group(section))
++
++    def _reveal_group(self, section) -> None:
++        """Its tab, expanded, scrolled into view; the panel opened with the
++        top bar's own toggle when it is closed (and not locked shut)."""
++        page = section
++        while page is not None and self.tabs.indexOf(page) < 0:
++            page = page.parentWidget()
++        if page is not None:
++            self.tabs.setCurrentIndex(self.tabs.indexOf(page))
++        section.set_expanded(True)
++        area = page if isinstance(page, QtWidgets.QScrollArea) else None
++        if area is not None:
++            area.ensureWidgetVisible(section, 0, 0)
++        if not self.isVisible():
++            toggle = self.window().findChild(QtWidgets.QAbstractButton, 'toggleRightPanelButton')
++            if toggle is not None and toggle.isEnabled() and not toggle.isChecked():
++                toggle.click()
++
+     def _special_desq(self, _options: dict):
+         """`{t:'desq'}` — anamorphic desqueeze.
+ 
+@@ -2032,6 +2088,8 @@
+             'Straighten': ('scan_frame', 'straighten_button'),
+             'Swap': ('scan_frame', 'swap_button'),
+             'Reset': ('scan_frame', 'reset_button'),
++            'Cancel  Esc': ('scan_frame', 'cancel_button'),
++            'Done  ↵': ('scan_frame', 'done_button'),
+         }
+         buttons = []
+         for label in wanted:
+@@ -2055,12 +2113,15 @@
+                 # Delete, which nobody asked to resize. The panel is what
+                 # re-presents these four as a row, so the panel is where
+                 # the row's shape belongs.
+-                button.setProperty('role', 'segmented')
++                # Done is the crop's way forward: the app's primary style
++                button.setProperty('role', 'accentAction' if label.startswith('Done')
++                                   else 'segmented')
+                 if where[0] == 'scan_frame':
+                     # 2026-09-30; see design/DECISIONS.md#d-edit_panel-512
+                     button.setFixedHeight(28)
+                     button.setStyleSheet(
+-                        'QPushButton[role="segmented"], QToolButton[role="segmented"] '
++                        'QPushButton[role="segmented"], QToolButton[role="segmented"], '
++                        'QPushButton[role="accentAction"] '
+                         '{ font-size: 11px; padding: 0px; min-height: 26px; }')
+                 button.style().unpolish(button)
+                 button.style().polish(button)
+@@ -2069,7 +2130,14 @@
+             self.missing['special'].append('btns')
+             return None
+ 
+-        return ButtonPair(*buttons)
++        pair = ButtonPair(*buttons)
++        if options.get('while') == 'cropping':
++            # Cancel · Done exist only while a crop is open
++            frame = getattr(self._widgets, 'scan_frame', None)
++            pair.setVisible(False)
++            if frame is not None:
++                frame.session_open_changed.connect(pair.setVisible)
++        return pair
+ 
+     def _paper_texture_buttons(self, wanted: tuple[str, ...]):
+         """The paper-texture stack, plus Add and Clear.
+--- a/src/spektrafilm_gui/edit_panel_spec.py
++++ b/src/spektrafilm_gui/edit_panel_spec.py
+@@ -347,12 +347,13 @@
+ ))
+ 
+ SCAN = Stage('scan', 'Scan', (
++    # The crop's one home: its settings, and while cropping its two exits.
++    # The canvas only has the frame; the rail only the on/off button.
+     Group('Frame', collapsed=True, rows=(
+-        'scan_finishing.crop', 'scan_finishing.crop_ratio',
+-        'scan_finishing.skew_deg', Special('desq'),
+-        Special('btns', {'items': ('Crop', 'Straighten', 'Swap', 'Reset')}),
+-        Special('note', {'text': 'Swap also lives in the top bar while the '
+-                                 'crop is armed.'}))),
++        'scan_finishing.crop_ratio', 'scan_finishing.skew_deg',
++        Special('constrain'), Special('desq'),
++        Special('btns', {'items': ('Crop', 'Straighten', 'Reset')}),
++        Special('btns', {'items': ('Cancel  Esc', 'Done  ↵'), 'while': 'cropping'}))),
+     Group('Scanner', collapsed=True, rows=(
+         'simulation.scan_lens_blur', 'simulation.scan_white_correction',
+         'simulation.scan_white_level', 'simulation.scan_black_correction',
+--- a/src/spektrafilm_gui/state_bridge.py
++++ b/src/spektrafilm_gui/state_bridge.py
+@@ -4,7 +4,9 @@
+ #   hand-kept name tuple and SECTION_STATE_ACCESSORS are gone, d339cce),
+ #   preview_max_size held as a machine preference across loads (NAT
+ #   2026-07-22), auto_preview never applied from a loaded state (NAT
+-#   2026-07-18), and scan_film round-tripped with the simulation section.
++#   2026-07-18), scan_film round-tripped with the simulation section,
++#   and the restore hook (restoring / is_restoring / on_restore) that lets
++#   controller_crop tell a stored look going back from the user's own edit.
+ # UPSTREAM: the apply/collect API shape; its gui_only nesting no longer
+ #   exists in our GuiState. No upstream commits here since 28bf883.
+ # ON CONFLICT: KEEP OURS. Their accessor table cannot fit our flat state;
+@@ -15,6 +17,8 @@
+ 
+ from __future__ import annotations
+ 
++import weakref
++from contextlib import contextmanager
+ from dataclasses import fields
+ from typing import Protocol, cast
+ 
+@@ -41,6 +45,43 @@
+     return cast(SupportsSectionState, getattr(widgets, section_name))
+ 
+ 
++#: Above 0 while a stored look is being put back into the widgets (undo,
++#: presets, roll frames, versions, pasted looks), so a listener can tell
++#: those value changes from the user's own (controller_crop opens the crop
++#: session on an angle the USER changes).
++_restoring = 0
++#: Called as a restore begins, before any value moves (controller_crop
++#: applies an open crop session there, so the look put back is not
++#: overwritten by the session's frame later). Weak, so a controller that
++#: goes away takes its listener with it.
++_restore_listeners: list = []
++
++
++def on_restore(bound_method) -> None:
++    _restore_listeners.append(weakref.WeakMethod(bound_method))
++
++
++@contextmanager
++def restoring():
++    global _restoring
++    _restoring += 1
++    try:
++        if _restoring == 1:
++            for ref in tuple(_restore_listeners):
++                listener = ref()
++                if listener is None:
++                    _restore_listeners.remove(ref)
++                else:
++                    listener()
++        yield
++    finally:
++        _restoring -= 1
++
++
++def is_restoring() -> bool:
++    return _restoring > 0
++
++
+ def apply_gui_state(state: GuiState, *, widgets: WidgetBundle) -> None:
+     apply_gui_state_sections(state, widgets=widgets, section_names=GUI_STATE_SECTION_NAMES)
+ 
+@@ -51,6 +92,12 @@
+     widgets: WidgetBundle,
+     section_names: tuple[str, ...],
+ ) -> None:
++    with restoring():
++        _apply_sections(state, widgets=widgets, section_names=section_names)
++
++
++def _apply_sections(state: GuiState, *, widgets: WidgetBundle,
++                    section_names: tuple[str, ...]) -> None:
+     for section_name in section_names:
+         if section_name == 'display':
+             # 2026-07-22; see design/DECISIONS.md#d-state_bridge-771
+--- a/src/spektrafilm_gui/dyeworks_widgets.py
++++ b/src/spektrafilm_gui/dyeworks_widgets.py
+@@ -45,14 +45,31 @@
+ 
+     _BOX = 28           # `ratioIcon(r, box=28)`: a 28px cell, 22 tall
+ 
+-    def __init__(self, combo: QtWidgets.QComboBox) -> None:
++    def __init__(self, combo: QtWidgets.QComboBox, *,
++                 trailing: QtWidgets.QWidget | None = None,
++                 portrait=None) -> None:
++        # `portrait`: () -> bool, the crop's orientation, so the swatch and
++        # caption show 3:2 as 0.67, portrait when the frame is turned
++        self._portrait = portrait
+         super().__init__(combo, caption='', chip='ratio')
+         self.swatch.setFixedSize(self._BOX, 22)
++        if trailing is not None:
++            # the crop's landscape / portrait pair, at the row's right end
++            self.layout().addSpacing(8)
++            self.layout().addWidget(trailing, 0, Qt.AlignVCenter)
+         self._paint_swatch()
+         self._sync()
+ 
+     def _ratio(self):
+-        return parse_ratio(self._combo.currentText())
++        from spektrafilm_gui.crop_frame import oriented_ratio
++
++        portrait = getattr(self, '_portrait', None)
++        return oriented_ratio(parse_ratio(self._combo.currentText()),
++                              bool(portrait()) if callable(portrait) else False)
++
++    def refresh(self) -> None:
++        """Show the combo and orientation again (set without a signal)."""
++        self._sync()
+ 
+     def _paint_swatch(self) -> None:
+         if getattr(self, '_chip', None) != 'ratio':
+--- a/src/spektrafilm_gui/dyeworks_icons.py
++++ b/src/spektrafilm_gui/dyeworks_icons.py
+@@ -113,6 +113,10 @@
+     # 20.2 (port wave 6): the top bar's Compare, its caret and the pipeline
+     # step between Input, Negative and Print -- `#i-cmp`, `#i-down`, `#i-step`
+     'cmp': '<rect x="1.8" y="3" width="12.4" height="10" rx="1.8"/><path d="M8 1.8v12.4"/>',
++    # the crop's Straighten (a ruler on the slant) and its orientation pair
++    'straighten': '<path d="M2 11.6 14 4.4"/><path d="M4.9 9.9l.8 1.3M7.9 8.1l.8 1.3M10.9 6.3l.8 1.3"/>',
++    'landscape': '<rect x="2" y="4.5" width="12" height="7" rx="1.4"/>',
++    'portrait': '<rect x="4.5" y="2" width="7" height="12" rx="1.4"/>',
+     'down': '<path d="M4 6l4 4 4-4"/>',
+     'step': '<path d="M3.6 1.8 6.8 5 3.6 8.2"/>',
+ }
+--- a/src/spektrafilm_gui/controller.py
++++ b/src/spektrafilm_gui/controller.py
+@@ -441,6 +441,7 @@
+         self._connect_recover_denoise()
+         self._connect_attempts()
+         self._connect_raw_toggle()
++        self._connect_crop_session()
+         # Phase 17C: the simulation footer's Test strip trigger (wired here,
+         # controller-side, so the protected app.py stays untouched).
+         strip_signal = getattr(getattr(self._widgets, 'simulation', None),
+@@ -543,6 +544,8 @@
+         self._home_input_stack()
+ 
+     def load_input_image(self, path: str) -> None:
++        if path != self._current_input_path:
++            self.apply_crop_session('Crop applied')
+         gui_state = collect_gui_state(widgets=self._widgets)
+         set_status(self._viewer, "Loading image...", timeout_ms=0)
+         try:
+@@ -564,9 +567,12 @@
+             set_status(self._viewer, 'Loaded RGB with white balance adjustment')
+         else:
+             set_status(self._viewer, 'Loaded RGB')
++        self._refit_session_frame()         # a re-read keeps an open session
+         self._request_auto_preview_if_enabled()
+ 
+     def load_raw_image(self, path: str) -> None:
++        if path != self._current_input_path:
++            self.apply_crop_session('Crop applied')
+         gui_state = collect_gui_state(widgets=self._widgets)
+         set_status(self._viewer, "Loading raw...", timeout_ms=0)
+         lens_info: dict[str, str] = {}
+@@ -620,6 +626,7 @@
+             set_status(self._viewer, "Loaded raw, lens correction not applied")
+         else:
+             set_status(self._viewer, "Loaded raw")
++        self._refit_session_frame()         # a re-decode keeps an open session
+         self._request_auto_preview_if_enabled()
+ 
+     # ------------------------------------------------------------------ roll
+@@ -727,11 +734,11 @@
+ 
+     # -- Phase 9: persistent Lightroom-style crop frame ----------------------
+     _frame_rect_uv = None
+-    _frame_initial = None            # (crop_active, center, size) for cancel
++    _frame_initial = None            # (crop_active, center, size, angle) for cancel
++    _frame_initial_ratio = None      # the Frame group's ratio text, for cancel
+ 
+     # 2026-09-19; see design/DECISIONS.md#d-controller-256
+     _skew_drag_state = None          # (skew_at_press, frame_at_press) while turning
+-    _frame_drag_from = None          # (handle, frame at the press, drag so far) while held
+ 
+     #: Shift turns this much slower, like the frame's other drags
+     SKEW_FINE_FACTOR = 0.2
+@@ -746,6 +753,8 @@
+         input_image = self._current_input_image
+         if input_image is None:
+             return
++        self.cancel_crop_session('Crop cancelled (photo turned)',
++                                 refresh=False)
+ 
+         rotated_image = np.rot90(np.asarray(input_image), k=int(quarter_turns))
+         self._input_turns = (self._input_turns + int(quarter_turns)) % 4
+@@ -3015,7 +3024,9 @@
+         # preview path scales down — Scan always renders full.
+         from spektrafilm_gui.widget_slider import drag_active
+         reduced = False
+-        if source_layer_name == INPUT_PREVIEW_LAYER_NAME and drag_active():
++        # (not while cropping: there an angle turns the kept frame instead)
++        if (source_layer_name == INPUT_PREVIEW_LAYER_NAME and drag_active()
++                and not self.crop_session_active()):
+             long_edge = int(max(image_data.shape[:2]))
+             target = int(round(long_edge / self._drag_preview_divisor))
+             if self._DRAG_MIN_LONG_EDGE <= target < long_edge:
+@@ -3030,6 +3041,12 @@
+             source_layer_name=source_layer_name,
+             rendered_image=image_data,
+         )
++        # While cropping, the film is rendered once without the turn and an
++        # angle only turns that frame (controller_crop): the turn is the last
++        # thing the pipeline does, so nothing before it needs to run again.
++        if self._crop_turn_fast_path(state, params, image_data, source_layer_name,
++                                     mode_label):
++            return
+         # Input-size guard, SYNCHRONOUSLY, before a worker is spun up: the
+         # engine raises the same ImageTooLargeError from crop_and_rescale as a
+         # safety net for every caller, but pre-checking here puts the dialog
+@@ -3117,6 +3134,7 @@
+         self._thread_pool.start(worker)
+ 
+     def _on_simulation_finished(self, result: SimulationResult) -> None:
++        result = self._crop_turn_result(result)     # a crop's unturned frame, kept and turned
+         report_status = self._active_simulation_reports_status
+         self._active_simulation_worker = None
+         self._active_simulation_label = None
+--- a/src/spektrafilm_gui/controller_history.py
++++ b/src/spektrafilm_gui/controller_history.py
+@@ -24,6 +24,9 @@
+     def _schedule_history_push(self) -> None:
+         if self._history_applying:
+             return
++        # The crop session is ONE step, recorded at Done (controller_crop).
++        if self.crop_session_active():
++            return
+         if self._history_timer is None:
+             self._history_timer = QTimer()
+             self._history_timer.setSingleShot(True)
+@@ -31,6 +34,13 @@
+         # Debounce: rapid slider/spinbox streams collapse into one snapshot.
+         self._history_timer.start(700)
+ 
++    def history_flush(self) -> None:
++        """Record the look now, pending edit or not -- the crop session lands
++        as one step on top of what was there before it (controller_crop)."""
++        if self._history_timer is not None:
++            self._history_timer.stop()
++        self._history_push_now()
++
+     def _history_push_now(self) -> None:
+         snapshot = gui_state_to_dict(collect_gui_state(widgets=self._widgets))
+         if self._history is None:
+@@ -45,6 +55,9 @@
+         self._history_index = len(self._history) - 1
+ 
+     def undo(self) -> None:
++        if self.crop_session_active():         # in the crop session, undo = Cancel
++            self.cancel_crop_session()
++            return
+         # Flush a pending debounce first so the current edit is undoable.
+         if self._history_timer is not None and self._history_timer.isActive():
+             self._history_timer.stop()
+@@ -56,6 +69,9 @@
+         self._history_apply(f'Undo ({self._history_index + 1}/{len(self._history)})')
+ 
+     def redo(self) -> None:
++        if self.crop_session_active():
++            set_status(self._viewer, 'Cropping')
++            return
+         if not self._history or self._history_index >= len(self._history) - 1:
+             set_status(self._viewer, 'Nothing to redo')
+             return
+--- a/src/spektrafilm_gui/controller_presets_canvas.py
++++ b/src/spektrafilm_gui/controller_presets_canvas.py
+@@ -404,6 +404,8 @@
+         the mode loads + renders the current frame properly so it can be
+         edited."""
+         on = bool(on)
++        if on:
++            self.apply_crop_session('Crop applied')
+         was_on = self._input_mode
+         self._input_mode = on
+         refresh_rings = getattr(self, '_refresh_dust_marks', None)    # the rings belong to the developed picture, not the thumbnail
+--- a/src/spektrafilm_gui/controller_roll.py
++++ b/src/spektrafilm_gui/controller_roll.py
+@@ -39,6 +39,9 @@
+             set_status(self._viewer, 'Busy rendering; wait before switching frames')
+             self._roll_refresh_view()
+             return
++        # a crop session belongs to its frame: leaving the frame applies it,
++        # before the frame's look is stored
++        self.apply_crop_session('Crop applied')
+         # Phase 17D: leaving a frame with changes captures an auto attempt.
+         self._capture_attempt_on_leave()
+         # Snapshot the outgoing frame's look, switch, restore the incoming one.
+--- a/src/spektrafilm_gui/viewer_rail.py
++++ b/src/spektrafilm_gui/viewer_rail.py
+@@ -208,12 +208,13 @@
+         column.addWidget(self.grip)
+ 
+         # QA 10-06 (NAT): Crop is the rail's first tool
+-        self.crop_button = _icon_button('crop', 'Crop', on_crop,
+-                                        object_name='cropModeButton', checkable=True)
+-        self.swap_button = _icon_button('swap', 'Swap the crop orientation', on_swap,
+-                                        object_name='swapCropButton')
+-        self.swap_button.setVisible(False)
+-        self.crop_button.toggled.connect(self.swap_button.setVisible)
++        # Crop's settings (and its orientation) live in Scan > Frame; the
++        # rail only starts and applies it. `on_swap` is still accepted.
++        self.crop_button = _icon_button(
++            'crop', 'Crop & straighten. Drag the handles to resize, inside to move, '
++            'outside the photo to turn (Shift = fine). Click again to apply.',
++            on_crop, object_name='cropModeButton', checkable=True)
++        self.swap_button = None
+         self.crop_button.toggled.connect(lambda *_: self._snap())
+         self.crop_button.toggled.connect(
+             lambda checked: refresh_icon_tint(self.crop_button, active=checked))
+--- a/src/spektrafilm_gui/field_labels.py
++++ b/src/spektrafilm_gui/field_labels.py
+@@ -209,7 +209,7 @@
+     'scan_finishing.saturation': 'Saturation',
+     'scan_finishing.shadow_tint_hue': 'Shadow tint hue',
+     'scan_finishing.shadow_tint_strength': 'Shadow tint',
+-    'scan_finishing.skew_deg': 'Straighten',
++    'scan_finishing.skew_deg': 'Angle',
+     'scan_finishing.toe_shoulder': 'Shape',
+     'scan_finishing.vibrance': 'Vibrance',
+     'scan_finishing.white_point': 'White point',
+--- a/src/spektrafilm_gui/widget_specs.py
++++ b/src/spektrafilm_gui/widget_specs.py
+@@ -1327,7 +1327,7 @@
+         ),
+         "skew_deg": WidgetSpec(
+             label="Skew",
+-            tooltip="Rotate the rendered film under the scanner (degrees, counter-clockwise positive) before the scan crop - straighten horizons while the crop stays axis-aligned. The corners outside the photo are white; crop them away.",
++            tooltip="Turn the photo (degrees, counter-clockwise positive). Changing it opens the crop with the frame fitted inside the turned photo; nothing applies until Done.",
+             min_value=-45.0, max_value=45.0, step=0.1, decimals=1,
+         ),
+         "desqueeze": WidgetSpec(
