@@ -1,0 +1,403 @@
+--- a/src/spektrafilm_gui/crop_frame.py
++++ b/src/spektrafilm_gui/crop_frame.py
+@@ -87,36 +87,62 @@
+ 
+ 
+ # ------------------------------------------------------------ interaction
+-def hit_test(rect_px, x, y, handle_radius=HANDLE_RADIUS_PX):
++#: Where a press takes the frame (widget px). A whole edge grabs within
++#: EDGE_GRAB_PX of its line, a corner within CORNER_GRAB_PX, and anything up
++#: to GRAB_BAND_PX OUTSIDE the frame takes the nearest edge or corner -- a
++#: grab a little off a handle resizes and never turns the photo; the turn
++#: starts beyond the band. (Fluent asks for 24 px targets at least; the old
++#: 16 px handles on an edge's midpoint left the rest of the edge line a
++#: knife-edge between moving the frame and turning the photo.)
++EDGE_GRAB_PX = 10.0
++CORNER_GRAB_PX = 14.0
++GRAB_BAND_PX = 20.0
++
++
++def hit_test(rect_px, x, y, handle_radius=None):
+     """'nw'|'n'|...|'w' when on a handle, 'inside' within the frame,
+-    'outside' otherwise. rect_px in widget pixels.
++    'outside' beyond the grab band. rect_px in widget pixels.
+ 
+     CORNERS are tested BEFORE edges (NAT 2026-07-23): a corner resizes both
+     axes, an edge resizes ONE — so an ambiguous grab near a corner must pick
+     the corner, else dragging collapses one dimension into a thin sliver (the
+-    'crop gives a long vertical line' report). Corners also get a slightly
+-    larger grab radius so they win the overlap zone."""
++    'crop gives a long vertical line' report). Corners also get the larger
++    reach so they win the overlap zone. `handle_radius` is kept for callers;
++    the reaches are the constants above."""
+     x0, y0, x1, y1 = rect_px
+-    xm, ym = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+-    corners = {'nw': (x0, y0), 'ne': (x1, y0), 'se': (x1, y1), 'sw': (x0, y1)}
+-    edges = {'n': (xm, y0), 'e': (x1, ym), 's': (xm, y1), 'w': (x0, ym)}
+-    for name, (hx, hy) in corners.items():
+-        if abs(x - hx) <= handle_radius * 1.5 and abs(y - hy) <= handle_radius * 1.5:
+-            return name
+-    for name, (hx, hy) in edges.items():
+-        if abs(x - hx) <= handle_radius and abs(y - hy) <= handle_radius:
+-            return name
+-    if x0 <= x <= x1 and y0 <= y <= y1:
+-        return 'inside'
+-    return 'outside'
++    if math.hypot(max(x0 - x, 0.0, x - x1), max(y0 - y, 0.0, y - y1)) > GRAB_BAND_PX:
++        return 'outside'
++    width, height = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
++
++    def side(v, low, high, reach):
++        if v <= low + reach:
++            return -1
++        if v >= high - reach:
++            return 1
++        return 0
++
++    # a small frame keeps a middle that moves it
++    corner_x = side(x, x0, x1, min(CORNER_GRAB_PX, width / 3.0))
++    corner_y = side(y, y0, y1, min(CORNER_GRAB_PX, height / 3.0))
++    if corner_x and corner_y:
++        return {(-1, -1): 'nw', (1, -1): 'ne', (1, 1): 'se', (-1, 1): 'sw'}[(corner_x, corner_y)]
++    edge_x = side(x, x0, x1, min(EDGE_GRAB_PX, width / 4.0))
++    edge_y = side(y, y0, y1, min(EDGE_GRAB_PX, height / 4.0))
++    if edge_y:
++        return 'n' if edge_y < 0 else 's'
++    if edge_x:
++        return 'w' if edge_x < 0 else 'e'
++    return 'inside'
+ 
+ 
+-def resize_rect(rect_uv, handle, du, dv, *, ratio_uv=None, min_size=MIN_CROP_SIZE):
++def resize_rect(rect_uv, handle, du, dv, *, ratio_uv=None, min_size=MIN_CROP_SIZE,
++                clamp=True):
+     """Drag a handle by (du, dv) in uv units. Corner handles move both edges,
+     edge handles one; the opposite side stays anchored. ``ratio_uv`` (a
+     width/height ratio ALREADY converted to uv units) constrains the shape;
+     for edge handles the perpendicular size follows, centered on the anchor
+-    edge. Result is clamped to [0, 1]."""
++    edge. Result is clamped to [0, 1] -- unless ``clamp`` is False, for a
++    caller that keeps the rect inside itself (`furthest_drag`)."""
+     u0, v0, u1, v1 = rect_uv
+     if 'w' in handle:
+         u0 = u0 + du
+@@ -165,6 +191,8 @@
+         elif 's' in handle:
+             v1 = v0 + h
+ 
++    if not clamp:
++        return (u0, v0, u1, v1)
+     return clamp_rect((u0, v0, u1, v1), (min_size, min_size))
+ 
+ 
+@@ -338,6 +366,75 @@
+                  for e in edges)
+ 
+ 
++def rect_inside_frame(rect_uv) -> bool:
++    return all(-1e-9 <= e <= 1.0 + 1e-9 for e in rect_uv)
++
++
++def rect_fits_rotated_image(rect_uv, skew_deg, image_wh, tolerance_px=0.05) -> bool:
++    """True when the rect lies inside the turned picture: each corner,
++    turned back about the centre as `fit_rect_in_rotated_image` turns it,
++    lands inside W x H less the same inset. Tested exactly, corner by
++    corner -- comparing with a re-fit is off by the fit's own rounding right
++    at the edge, which would refuse drags that keep a corner there."""
++    if abs(float(skew_deg)) < 1e-9:
++        return rect_inside_frame(rect_uv)
++    width, height = max(float(image_wh[0]), 1.0), max(float(image_wh[1]), 1.0)
++    inset = min(ROTATED_FIT_INSET_PX, width / 4.0, height / 4.0)
++    half_w, half_h = width / 2.0 - inset + tolerance_px, height / 2.0 - inset + tolerance_px
++    theta = math.radians(float(skew_deg))
++    cos_t, sin_t = math.cos(theta), math.sin(theta)
++    u0, v0, u1, v1 = (float(v) for v in rect_uv)
++    for u in (u0, u1):
++        for v in (v0, v1):
++            x, y = (u - 0.5) * width, (v - 0.5) * height
++            if (abs(x * cos_t - y * sin_t) > half_w or abs(x * sin_t + y * cos_t) > half_h):
++                return False
++    return True
++
++
++def furthest_drag(rect_at, fits, steps=30) -> float:
++    """How far along a drag the frame can go and still fit: the largest t in
++    [0, 1] with ``fits(rect_at(t))``, ``rect_at(0)`` being where the drag
++    started. Bisected, so the frame STOPS where it meets the picture's edge
++    -- nothing is slid or shrunk back in, which moved the edges the user
++    was not holding."""
++    if fits(rect_at(1.0)):
++        return 1.0
++    low, high = 0.0, 1.0
++    for _ in range(steps):
++        middle = (low + high) / 2.0
++        if fits(rect_at(middle)):
++            low = middle
++        else:
++            high = middle
++    return low
++
++
++def fit_rect_about_centre(rect_uv, skew_deg, image_wh):
++    """The rect kept inside the image turned by skew_deg by SHRINKING it
++    about its own centre (aspect kept) -- what a turn does to the frame the
++    user set, so the part of the photo they framed stays where they put it
++    (`fit_rect_in_rotated_image` slides it toward the middle instead). Only
++    when no size fits at that centre does it fall back to sliding."""
++    if abs(float(skew_deg)) < 1e-9:
++        return clamp_rect(tuple(rect_uv))
++    u0, v0, u1, v1 = (float(v) for v in rect_uv)
++    cu, cv = (u0 + u1) / 2.0, (v0 + v1) / 2.0
++    hu, hv = (u1 - u0) / 2.0, (v1 - v0) / 2.0
++
++    def at(scale):
++        return (cu - hu * scale, cv - hv * scale, cu + hu * scale, cv + hv * scale)
++
++    def fits(rect):
++        return rect_inside_frame(rect) and rect_fits_rotated_image(rect, skew_deg, image_wh)
++
++    if fits(at(1.0)):
++        return at(1.0)
++    if not fits(at(1e-3)):
++        return fit_rect_in_rotated_image(rect_uv, skew_deg, image_wh)
++    return at(max(furthest_drag(at, fits), 1e-3))
++
++
+ # ---------------------------------------------------------- skew by dragging
+ def pointer_angle_deg(cx, cy, x, y):
+     """The pointer's angle about (cx, cy) in screen coordinates (y down),
+--- a/src/spektrafilm_gui/controller_crop.py
++++ b/src/spektrafilm_gui/controller_crop.py
+@@ -17,9 +17,11 @@
+     MIN_CROP_SIZE,
+     angle_from_line,
+     crop_rect_uv,
+-    fit_rect_in_rotated_image,
+-    move_image_under_frame,
++    fit_rect_about_centre,
++    furthest_drag,
+     parse_ratio,
++    rect_fits_rotated_image,
++    rect_inside_frame,
+     rect_to_center_size,
+     refit_to_ratio,
+     resize_rect,
+@@ -200,7 +202,7 @@
+         self._gpu_canvas.arm_crop_tool(
+             'frame',
+             on_frame_drag=self._frame_dragged,
+-            on_frame_release=lambda: None,
++            on_frame_release=self._frame_drag_released,
+             on_frame_commit=self._frame_commit,
+             on_frame_cancel=self._frame_cancel,
+             on_skew_start=self._skew_drag_started,
+@@ -225,7 +227,8 @@
+         """Turn the image by the pointer's turn about the picture's centre,
+         and fit the crop inside the turned image. The fit starts from the
+         frame as it was at the PRESS, so turning back within one drag gives
+-        the frame back rather than leaving it shrunk."""
++        the frame back rather than leaving it shrunk, and shrinks it about
++        its own centre, so it stays where the user put it."""
+ 
+         state = self._skew_drag_state
+         if state is None or self._frame_rect_uv is None:
+@@ -233,7 +236,7 @@
+         state[0] += float(delta_deg) * (self.SKEW_FINE_FACTOR if fine else 1.0)
+         state[0] = max(min(state[0], 45.0), -45.0)
+         skew = round(state[0], 2)
+-        self._frame_rect_uv = fit_rect_in_rotated_image(state[1], skew, self._crop_image_wh())
++        self._frame_rect_uv = fit_rect_about_centre(state[1], skew, self._crop_image_wh())
+         self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+         self._widgets.scan_finishing.skew_deg.value = skew
+ 
+@@ -248,21 +251,56 @@
+                    f'Straightened: skew {float(self._widgets.scan_finishing.skew_deg.value):+.2f} deg')
+ 
+     def _frame_dragged(self, hit: str, du: float, dv: float, fine: bool) -> None:
++        """A handle (or the frame) held and moved. Tracked from where the
++        drag started, as Lightroom's is: only what is held moves, it stops
++        where it meets the picture's edge, and it follows the pointer again
++        once the pointer comes back. (It used to fit the dragged frame into
++        the turned picture -- d-controller-257 -- which slid and shrank it,
++        moving the edges the user was not holding.)"""
+         if self._frame_rect_uv is None:
+             return
+         factor = 0.2 if fine else 1.0
+-        du, dv = du * factor, dv * factor
+-        if hit == 'inside':
+-            rect = move_image_under_frame(self._frame_rect_uv, du, dv)
+-        else:
+-            rect = resize_rect(self._frame_rect_uv, hit, du, dv,
+-                               ratio_uv=self._frame_ratio_uv())
+-        # 2026-09-20; see design/DECISIONS.md#d-controller-257
+-        skew = float(self._widgets.scan_finishing.skew_deg.value)
+-        rect = fit_rect_in_rotated_image(rect, skew, self._crop_image_wh())
++        if self._frame_drag_from is None or self._frame_drag_from[0] != hit:
++            self._frame_drag_from = (hit, self._frame_rect_uv, [0.0, 0.0])
++        _hit, start, total = self._frame_drag_from
++        total[0] += du * factor
++        total[1] += dv * factor
++        rect = self._held_frame(hit, start, total[0], total[1])
+         self._frame_rect_uv = rect
+         self._gpu_canvas.set_crop_frame(rect)
+ 
++    def _frame_drag_released(self) -> None:
++        self._frame_drag_from = None
++
++    def _held_frame(self, hit: str, start, du: float, dv: float):
++        """The frame `start` with `hit` dragged by (du, dv), as far as it can
++        go inside the turned picture."""
++        ratio = self._frame_ratio_uv() if hit != 'inside' else None
++        skew = float(self._widgets.scan_finishing.skew_deg.value)
++        image_wh = self._crop_image_wh()
++
++        def at(du_, dv_):
++            if hit == 'inside':                 # the frame follows the pointer
++                u0, v0, u1, v1 = start
++                return (u0 + du_, v0 + dv_, u1 + du_, v1 + dv_)
++            return resize_rect(start, hit, du_, dv_, ratio_uv=ratio, clamp=False)
++
++        def fits(rect):
++            return rect_inside_frame(rect) and rect_fits_rotated_image(rect, skew, image_wh)
++
++        if not fits(start):                     # (a frame from before the angle)
++            rect = resize_rect(start, hit, du, dv, ratio_uv=ratio) if hit != 'inside' else start
++            return fit_rect_about_centre(rect, skew, image_wh)
++        if ratio is not None and len(hit) == 2:
++            # a corner on a locked ratio: both axes move together
++            t = furthest_drag(lambda t: at(t * du, t * dv), fits)
++            return at(t * du, t * dv)
++        # each axis on its own, so a corner (or the frame) meeting one edge
++        # still slides along it
++        tu = furthest_drag(lambda t: at(t * du, 0.0), fits)
++        tv = furthest_drag(lambda t: at(tu * du, t * dv), fits)
++        return at(tu * du, tv * dv)
++
+     def _frame_commit(self) -> None:
+         if self._frame_rect_uv is None:
+             return
+@@ -379,13 +417,13 @@
+         # 2026-09-19; see design/DECISIONS.md#d-controller-258
+         image_wh = self._crop_image_wh()
+         if self._frame_rect_uv is not None:
+-            self._frame_rect_uv = fit_rect_in_rotated_image(
++            self._frame_rect_uv = fit_rect_about_centre(
+                 self._frame_rect_uv, new_skew, image_wh)
+             self._gpu_canvas.set_crop_frame(self._frame_rect_uv)
+         elif bool(finishing_widgets.crop.value):
+             center = tuple(float(v) for v in finishing_widgets.crop_center.value)
+             size = tuple(float(v) for v in finishing_widgets.crop_size.value)
+-            rect = fit_rect_in_rotated_image(
++            rect = fit_rect_about_centre(
+                 crop_rect_uv(center, size, image_wh), new_skew, image_wh)
+             new_center, new_size = rect_to_center_size(rect, image_wh)
+             finishing_widgets.crop_center.value = new_center
+--- a/src/spektrafilm_gui/controller.py
++++ b/src/spektrafilm_gui/controller.py
+@@ -731,6 +731,7 @@
+ 
+     # 2026-09-19; see design/DECISIONS.md#d-controller-256
+     _skew_drag_state = None          # (skew_at_press, frame_at_press) while turning
++    _frame_drag_from = None          # (handle, frame at the press, drag so far) while held
+ 
+     #: Shift turns this much slower, like the frame's other drags
+     SKEW_FINE_FACTOR = 0.2
+--- a/src/spektrafilm_gui/gpu_canvas.py
++++ b/src/spektrafilm_gui/gpu_canvas.py
+@@ -1320,15 +1320,37 @@
+             the frame, not the widget."""
+             if not self._skew_armed():
+                 return False
+-            if self._outside_canvas(event_pos):
+-                return True
++            # the frame's grab band first: it reaches past the picture, and a
++            # press in it resizes, never turns
++            hit = self._frame_hit(event_pos)
++            if hit is None:
++                return self._outside_canvas(event_pos)
++            return hit == 'outside'
++
++        def _frame_hit(self, event_pos):
++            """What a press here takes of the armed crop frame ('outside'
++            beyond its grab band), or None with no frame armed."""
++            if self._host.crop_mode != 'frame':
++                return None
+             frame = self._host.frame_rect_px()
+             if frame is None:
+-                return False
++                return None
+             from spektrafilm_gui.crop_frame import hit_test
+ 
+             pos = self._to_canvas(event_pos)
+-            return hit_test(frame, pos.x(), pos.y()) == 'outside'
++            return hit_test(frame, pos.x(), pos.y())
++
++        #: the cursor that says what a press on the frame will do
++        _FRAME_CURSORS = {
++            'n': QtCore.Qt.SizeVerCursor, 's': QtCore.Qt.SizeVerCursor,
++            'e': QtCore.Qt.SizeHorCursor, 'w': QtCore.Qt.SizeHorCursor,
++            'nw': QtCore.Qt.SizeFDiagCursor, 'se': QtCore.Qt.SizeFDiagCursor,
++            'ne': QtCore.Qt.SizeBDiagCursor, 'sw': QtCore.Qt.SizeBDiagCursor,
++            'inside': QtCore.Qt.SizeAllCursor,
++        }
++
++        def _frame_cursor(self, event_pos):
++            return self._FRAME_CURSORS.get(self._frame_hit(event_pos))
+ 
+         def mousePressEvent(self, event) -> None:  # noqa: N802
+             if event.button() != QtCore.Qt.LeftButton:
+@@ -1344,6 +1366,12 @@
+             # inside it, which is exactly what happened when the overlay
+             # stopped at the canvas edge.
+             if self._outside_canvas(event.position()):
++                hit = self._frame_hit(event.position())
++                if hit not in (None, 'outside', 'inside'):
++                    # the frame's grab band reaches past the picture's edge
++                    pos = self._to_canvas(event.position())
++                    self._frame_drag = (hit, pos.x(), pos.y())
++                    return
+                 event.ignore()
+                 return
+             pos = self._to_canvas(event.position())
+@@ -1415,14 +1443,18 @@
+                 if self._cursor is not None:
+                     self._cursor = None
+                     self.update()
+-                self._set_cursor(rotate_cursor() if skew_zone else QtCore.Qt.ArrowCursor)
++                self._set_cursor(rotate_cursor() if skew_zone else
++                                 (self._frame_cursor(event.position()) or QtCore.Qt.ArrowCursor))
+                 event.ignore()
+                 return
+             if self._seam_drag:
+                 self._host.seam_from_x(pos.x())
+                 return
++            frame_cursor = None if (in_progress or skew_zone) else self._frame_cursor(event.position())
+             if skew_zone:
+                 self._set_cursor(rotate_cursor())
++            elif frame_cursor is not None:
++                self._set_cursor(frame_cursor)
+             else:
+                 self._update_seam_cursor(pos.x())
+             # Loupe hover tracking (never blocks the drag tools below).
+--- a/src/spektrafilm_gui/widget_specs.py
++++ b/src/spektrafilm_gui/widget_specs.py
+@@ -1313,15 +1313,17 @@
+             label="Crop",
+             tooltip="Scan-time crop: a cutout of the RENDERED film. Grain, halation and diffusion keep their full-frame scale - zoom into the grain, unlike the camera crop on MAIN which re-frames the film gate.",
+         ),
++        # four decimals: 0.0001 of the long edge is ~0.6 px at 24 MP, so the
++        # crop Done keeps is the frame on screen (two decimals were ~60 px)
+         "crop_center": WidgetSpec(
+             label="Crop center",
+             tooltip="Center of the scan crop in normalized coordinates x, y (0-1) of the rendered scan.",
+-            step=0.01, min_value=0, max_value=1,
++            step=0.01, min_value=0, max_value=1, decimals=4,
+         ),
+         "crop_size": WidgetSpec(
+             label="Crop size",
+             tooltip="Normalized size of the scan crop in x, y as fraction of the long side.",
+-            step=0.01, min_value=0, max_value=1,
++            step=0.01, min_value=0, max_value=1, decimals=4,
+         ),
+         "skew_deg": WidgetSpec(
+             label="Skew",
