@@ -1,0 +1,36 @@
+--- a/src/spektrafilm/utils/raw_file_processor.py
++++ b/src/spektrafilm/utils/raw_file_processor.py
+@@ -7,7 +7,8 @@
+ #   errors (2026-07-22/25), `_lens_correct`, `_convert_output_colorspace`,
+ #   and the optional `recover` argument (highlight mode, cached denoise, dust
+ #   removal, Barrel, Vignette; `raw_recover.py`), which changes nothing when it
+-#   is None.
++#   is None. The fixed-lens fallback at the end of `_find_lens_candidates`
++#   (the one lens lensfun has for a Leica Q / Q2 / Q3 and the like).
+ #   The decode is not bit-reproducible, accepted (B11).
+ # UPSTREAM: _postprocess_params, the WB/tint math, lens correction, EXIF.
+ # ON CONFLICT: keep ours; port their changes into the helpers the split
+@@ -292,10 +293,22 @@
+             return direct_candidates
+ 
+     broader_candidates = dedupe(db.find_lenses(camera, None, None, loose_search=True))
+-    return [
++    named_candidates = [
+         lens for lens in broader_candidates
+         if _lens_model_score(getattr(lens, 'model', ''), exif_metadata.lens_model) > (0, 0, 0)
+     ]
++    if named_candidates:
++        return named_candidates
++    # A fixed-lens camera has ONE lens in lensfun, named after the camera
++    # ("LEICA Q2 & compatibles", used for the Q2 and the Q3), while the camera
++    # writes its lens as "SUMMILUX 1:1.7/28 ASPH." or "28.0 mm f/1.7": no word
++    # in common, so the test above drops the right profile and no correction
++    # is applied. That one lens is the lens, when the focal length is in its
++    # range. (A camera with interchangeable lenses lists every lens of its
++    # mount; in lensfun's database only fixed-lens cameras have exactly one.)
++    if len(broader_candidates) == 1 and _lens_matches_focal(broader_candidates[0], exif_metadata.focal_length):
++        return broader_candidates
++    return []
+ 
+ 
+ def _select_lens_candidate(lenses: list[object], exif_metadata: ExifData) -> object:
