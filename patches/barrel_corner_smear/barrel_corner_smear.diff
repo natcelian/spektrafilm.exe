@@ -1,0 +1,93 @@
+--- a/src/spektrafilm/utils/raw_recover.py
++++ b/src/spektrafilm/utils/raw_recover.py
+@@ -20,6 +20,16 @@
+ _VIGNETTE_LIGHTEN_AT_100 = 2.0
+ 
+ 
++def barrel_fit(k: float) -> float:
++    """The scale that keeps a positive Barrel inside the photo. Its remap
++    reads radius * (1 + k r^2), which past the edges is outside the photo and
++    was clamped to the edge pixel, repeated as streaks; times this, the
++    corner (r = 1) reads the corner and every other pixel reads inside -- the
++    same curve, the picture just fitted to the frame. A negative Barrel
++    already reads inside (1)."""
++    return 1.0 / (1.0 + k) if k > 0.0 else 1.0
++
++
+ @dataclass(frozen=True, slots=True)
+ class DefectsPlan:
+     """The dust to remove from a frame: the spots as JSON text (so plans compare), how, and how much."""
+@@ -66,7 +76,7 @@
+ 
+ 
+ @njit(parallel=True, cache=True)
+-def _lens_adjust(src, dst, k, gain_dark, gain_light):
++def _lens_adjust(src, dst, k, fit, gain_dark, gain_light):
+     height, width, channels = src.shape
+     cy = (height - 1) / 2.0
+     cx = (width - 1) / 2.0
+@@ -76,7 +86,7 @@
+             dy = (y - cy) / half_diagonal
+             dx = (x - cx) / half_diagonal
+             r2 = dx * dx + dy * dy
+-            scale = 1.0 + k * r2
++            scale = (1.0 + k * r2) * fit
+             sx = cx + (x - cx) * scale
+             sy = cy + (y - cy) * scale
+             sx = min(max(sx, 0.0), width - 1.0)
+@@ -100,7 +110,7 @@
+ 
+     Radius is measured from the image centre to the half diagonal, so 1 is the
+     corner. Both are empirical curves, not a lens model; zero returns `rgb`
+-    itself.
++    itself. A positive Barrel is fitted to the frame (`barrel_fit`).
+     """
+     if not barrel and not vignette:
+         return rgb
+@@ -108,5 +118,6 @@
+     out = np.empty_like(source)
+     gain_dark = _VIGNETTE_DARKEN_AT_100 * vignette / 100.0 if vignette > 0 else 0.0
+     gain_light = _VIGNETTE_LIGHTEN_AT_100 * -vignette / 100.0 if vignette < 0 else 0.0
+-    _lens_adjust(source, out, BARREL_AT_100 * barrel / 100.0, gain_dark, gain_light)
++    k = BARREL_AT_100 * barrel / 100.0
++    _lens_adjust(source, out, k, barrel_fit(k), gain_dark, gain_light)
+     return out
+--- a/src/spektrafilm/utils/dust_geometry.py
++++ b/src/spektrafilm/utils/dust_geometry.py
+@@ -13,7 +13,7 @@
+ 
+ from spektrafilm.utils.raw_file_processor import (
+     _find_lens_candidates, _select_lens_candidate, read_exif_metadata)
+-from spektrafilm.utils.raw_recover import BARREL_AT_100
++from spektrafilm.utils.raw_recover import BARREL_AT_100, barrel_fit
+ 
+ _GRID = 48
+ _NEWTON_STEPS = 8
+@@ -29,21 +29,23 @@
+     half_diagonal = np.hypot(cx, cy)
+     d = (points - [cx, cy]) / half_diagonal
+     r2 = (d ** 2).sum(axis=1, keepdims=True)
+-    return np.array([cx, cy]) + (points - [cx, cy]) * (1.0 + barrel_k(barrel) * r2)
++    k = barrel_k(barrel)
++    return np.array([cx, cy]) + (points - [cx, cy]) * (1.0 + k * r2) * barrel_fit(k)
+ 
+ 
+ def barrel_forward(points: np.ndarray, width: int, height: int, barrel: float) -> np.ndarray:
+-    """Source pixel -> where the barrel step puts it: the radius s with s (1 + k (s / R)^2) = r.
++    """Source pixel -> where the barrel step puts it: the radius s with s (1 + k (s / R)^2) fit = r.
+     NaN for a pixel the step takes off the picture."""
+     cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+     half_diagonal = np.hypot(cx, cy)
+     k = barrel_k(barrel)
++    fit = barrel_fit(k)
+     offset = points - [cx, cy]
+     r = np.hypot(offset[:, 0], offset[:, 1])
+     s = r.copy()
+     for _ in range(_NEWTON_STEPS):
+-        f = s * (1.0 + k * (s / half_diagonal) ** 2) - r
+-        df = 1.0 + 3.0 * k * (s / half_diagonal) ** 2
++        f = s * (1.0 + k * (s / half_diagonal) ** 2) * fit - r
++        df = (1.0 + 3.0 * k * (s / half_diagonal) ** 2) * fit
+         s = s - f / np.where(np.abs(df) < 1e-6, 1e-6, df)
+     scale = np.divide(s, r, out=np.ones_like(r), where=r > 1e-9)
+     placed = np.array([cx, cy]) + offset * scale[:, None]
