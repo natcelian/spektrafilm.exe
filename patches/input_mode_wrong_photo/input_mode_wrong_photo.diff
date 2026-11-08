@@ -1,0 +1,336 @@
+--- a/src/spektrafilm_gui/controller.py
++++ b/src/spektrafilm_gui/controller.py
+@@ -742,6 +742,8 @@
+         self._rotate_input_image(quarter_turns=1)
+ 
+     def _rotate_input_image(self, *, quarter_turns: int) -> None:
++        if not self._load_selected_frame():
++            return
+         input_image = self._current_input_image
+         if input_image is None:
+             return
+@@ -1079,6 +1081,8 @@
+         if self._active_simulation_worker is not None or self._active_export_worker is not None:
+             set_status(self._viewer, 'Busy rendering; try the test strip afterwards')
+             return
++        if not self._load_selected_frame():
++            return
+         image_data = self._simulation_input_image(
+             source_layer_name=INPUT_PREVIEW_LAYER_NAME)
+         if image_data is None:
+@@ -1414,6 +1418,12 @@
+         return False
+ 
+     def save_output_layer(self) -> None:
++        if not self._loaded_frame_is_current():
++            # The render on hand is another frame's (sorting moved on); it
++            # would be saved under the selected frame's name.
++            notices.warn(dialog_parent(self._viewer), 'Save output',
++                         'Open this frame and render it before saving its output.')
++            return
+         output_layer = self._output_layer()
+         if output_layer is None:
+             notices.warn(dialog_parent(self._viewer), 'Save output', 'Run a simulation before saving the output layer.')
+@@ -1518,6 +1528,8 @@
+         if self._active_simulation_worker is not None:
+             set_status(self._viewer, 'A render is already running; wait before exporting.')
+             return
++        if not self._load_selected_frame():
++            return
+ 
+         state = collect_gui_state(widgets=self._widgets)
+         ext, bit_depth = export_format_spec(state.simulation.export_format)
+@@ -1937,7 +1949,15 @@
+     _showing_input = False
+     # 2026-07-25, 2026-07-26, 2026-09-05; see design/DECISIONS.md#d-controller-287
+     _input_mode = False
+-    _input_mode_navigated = False
++    _input_mode_navigated = False    # still set; `_loaded_frame_is_current` decides now
++    #: the file the input layers were last decoded from (sorting skips it)
++    _loaded_input_path = None
++    #: one queued auto preview to drop (see `_load_selected_frame`)
++    _skip_scheduled_auto_preview = False
++    #: full screen asked for while sorting: shown when its render lands
++    _fullscreen_when_rendered = False
++    #: a render skipped while sorting (a paste, a reset): leaving sorting pays it
++    _render_owed_after_sorting = False
+     _input_mode_button = None
+     #: set by app.py to the window's `set_side_panels_visible` (see below)
+     _set_side_panels = None
+@@ -1975,6 +1995,7 @@
+         self,
+         image: np.ndarray,
+     ) -> None:
++        self._loaded_input_path = self._current_input_path
+         self._update_preview_cache(
+             image,
+             home_input_stack=True,
+@@ -2226,6 +2247,14 @@
+ 
+     def _run_scheduled_auto_preview(self) -> None:
+         self._auto_preview_scheduled = False
++        if self._skip_scheduled_auto_preview:
++            self._skip_scheduled_auto_preview = False
++            return
++        # Sorting renders nothing (thumbnails only); the render is owed, and
++        # leaving sorting pays it.
++        if self._input_mode:
++            self._render_owed_after_sorting = True
++            return
+         if not self._auto_preview_enabled() or self._current_preview_image is None:
+             self._pending_auto_preview = False
+             return
+@@ -3003,6 +3032,8 @@
+         # Phase 17C: any new render supersedes a shown test strip.
+         if self._strip_bands is not None:
+             self._dismiss_test_strip(None)
++        if not self._load_selected_frame(render_follows=True):
++            return
+ 
+         image_data = self._simulation_input_image(source_layer_name=source_layer_name)
+         if image_data is None:
+@@ -3148,6 +3179,9 @@
+             # 2026-10-07; see design/DECISIONS.md#d-controller-300
+             QtCore.QTimer.singleShot(0, self._develop_print)
+         self._show_last_render()
++        if self._fullscreen_when_rendered:
++            self._fullscreen_when_rendered = False
++            self.show_fullscreen_output()
+         # Phase 17B live loop: while the loupe is up, every completed
+         # preview cycle re-arms one coalesced full-quality loupe refresh.
+         if self._loupe_active and self._loupe_rest_timer is not None:
+@@ -3269,6 +3303,7 @@
+         self._active_simulation_label = None
+         self._active_simulation_reports_status = True
+         self._set_simulation_controls_enabled(True)
++        self._fullscreen_when_rendered = False
+         notices.fail(dialog_parent(self._viewer), 'Run simulation', f'Simulation failed.\n\n{message}')
+         set_status(self._viewer, f'{mode_label} failed')
+         self._replay_pending_auto_preview()
+--- a/src/spektrafilm_gui/controller_attempts.py
++++ b/src/spektrafilm_gui/controller_attempts.py
+@@ -51,8 +51,8 @@
+         fatal), per the 17D capture rule."""
+ 
+         image = self._input_display_cached
+-        if image is None:
+-            return None
++        if image is None or not self._loaded_frame_is_current():
++            return None     # that preview is another frame's
+         array = np.asarray(image)
+         if array.dtype != np.uint8:
+             array = (np.clip(array, 0.0, 1.0) * 255).astype(np.uint8)
+--- a/src/spektrafilm_gui/controller_compare.py
++++ b/src/spektrafilm_gui/controller_compare.py
+@@ -62,6 +62,11 @@
+         roll_file = self._roll.current
+         if roll_file is None or not self._roll.is_reference(roll_file):
+             return
++        if not self._loaded_frame_is_current():
++            # The render on hand is another frame's: drop the old pin rather
++            # than show it as this one; the frame's next render pins it.
++            self._reference_image = None
++            return
+         image = self._output_display_cached
+         if image is None:
+             return
+@@ -78,7 +83,7 @@
+         """Pin the current print as this image's last kept version."""
+         key = self._kept_key()
+         image = self._output_display_cached
+-        if key is None or image is None:
++        if key is None or image is None or not self._loaded_frame_is_current():
+             return
+         if self._kept_images is None:
+             self._kept_images = {}
+@@ -286,6 +291,8 @@
+         if self._active_export_worker is not None:
+             set_status(self._viewer, 'Export running; wait before comparing.')
+             return
++        if not self._load_selected_frame():
++            return
+         request = self._build_compare_negative_request()
+         if request is None:
+             set_status(self._viewer, 'Load an image before comparing')
+@@ -513,6 +520,15 @@
+         """Full-screen the rendered output (white padding included) on a
+         completely black background."""
+ 
++        if not self._loaded_frame_is_current():
++            # Sorting moved on and the render on hand is another frame's:
++            # open the selected one, render it, and go full screen when that
++            # render lands (`_on_simulation_finished`).
++            self._fullscreen_when_rendered = True
++            self._run_preview(report_status=True)
++            if self._active_simulation_worker is None:      # refused, or not loadable
++                self._fullscreen_when_rendered = False
++            return
+         output_layer = self._output_layer()
+         if output_layer is None:
+             set_status(self._viewer, 'Run a preview or scan before going full screen')
+--- a/src/spektrafilm_gui/controller_crop.py
++++ b/src/spektrafilm_gui/controller_crop.py
+@@ -548,6 +548,8 @@
+         self._mirror_input_image(axis=0)
+ 
+     def _mirror_input_image(self, *, axis: int) -> None:
++        if not self._load_selected_frame():
++            return
+         input_image = self._current_input_image
+         if input_image is None:
+             return
+@@ -683,6 +685,9 @@
+         (routing them through request_auto_preview made the toggle and Ctrl+F
+         look dead — NAT 2026-07-12)."""
+         self._schedule_history_push()
++        if self._input_mode:
++            self._render_owed_after_sorting = True   # sorting renders nothing
++            return
+         if self._current_preview_image is None:
+             return
+         if self._auto_preview_enabled():
+--- a/src/spektrafilm_gui/controller_loupe.py
++++ b/src/spektrafilm_gui/controller_loupe.py
+@@ -175,6 +175,12 @@
+         if self._loupe_active:
+             self._deactivate_loupe('Loupe off')
+             return
++        if not self._loaded_frame_is_current():
++            # The loupe magnifies a render of THIS frame, and there is none
++            # yet: open the frame, which renders it.
++            if self._load_selected_frame():
++                set_status(self._viewer, 'Opened the frame; use the loupe once it has rendered')
++            return
+         state = collect_gui_state(widgets=self._widgets)
+         reason = self._loupe_unavailable_reason(state)
+         if reason is not None:
+--- a/src/spektrafilm_gui/controller_neutral_sample.py
++++ b/src/spektrafilm_gui/controller_neutral_sample.py
+@@ -18,6 +18,8 @@
+     def arm_neutral_sample(self, armed: bool) -> None:
+         """Arm the canvas for one neutral pick, or disarm it."""
+         armed = bool(armed)
++        if armed and not self._load_selected_frame():    # sample its own pixels
++            armed = False
+         self._neutral_sample_armed = armed
+         canvas = self._gpu_canvas
+         if canvas is not None and callable(getattr(canvas, 'arm_strip_click', None)):
+--- a/src/spektrafilm_gui/controller_presets_canvas.py
++++ b/src/spektrafilm_gui/controller_presets_canvas.py
+@@ -352,8 +352,11 @@
+         input DISPLAY and the last render, without re-running the pipeline
+         (this is the accurate full-quality input, distinct from the instant
+         thumbnail of the sorting mode). First press with nothing rendered kicks
+-        a preview so there is an 'after' to compare against (NAT 2026-07-18)."""
+-        if self._output_display_cached is None and self._output_layer() is None:
++        a preview so there is an 'after' to compare against (NAT 2026-07-18).
++        So does a press while sorting has moved on: the render on hand is
++        another frame's, and the preview opens the selected one."""
++        if (not self._loaded_frame_is_current()
++                or (self._output_display_cached is None and self._output_layer() is None)):
+             self._run_preview(report_status=True)
+             self._showing_input = False
+             return
+@@ -419,10 +422,16 @@
+         else:
+             # Clears the pinned sorting hint above, which has no timeout.
+             set_status(self._viewer, 'Edit mode')
+-            # If the user navigated frames while sorting, the loaded image is
+-            # stale — reload + render the current frame so editing is correct.
+-            if was_on and self._input_mode_navigated:
++            owed = self._render_owed_after_sorting
++            self._render_owed_after_sorting = False
++            # If the loaded image is not the selected frame's (sorting moved
++            # on), reload + render the current frame so editing is correct.
++            if was_on and not self._loaded_frame_is_current():
+                 if self._roll.current is not None:
++                    # Sorting applied this frame's look to the panels; keep
++                    # what changed since (a paste, a reset) before the reload
++                    # restores the stored one.
++                    self._roll.store_state_for_current(collect_gui_state(widgets=self._widgets))
+                     self._roll_load_current(restore_state=True)
+                 elif self._current_input_path:
+                     self._reload_current_input()
+@@ -444,7 +453,9 @@
+                 # click. The auto-preview toggle it goes through is the one
+                 # already on Config > Display preferences, so a user who has
+                 # turned it off still gets what they asked for.
+-                if not restore_output:
++                # So does a look changed while sorting (a paste, a reset):
++                # its render was skipped, and the print on hand predates it.
++                if not restore_output or owed:
+                     self._request_auto_preview_if_enabled()
+         # 2026-07-26; see design/DECISIONS.md#d-controller-290
+         if not on:
+@@ -455,6 +466,45 @@
+         self._apply_input_mode_chrome(on)
+         self._sync_input_mode_button()
+ 
++    def _loaded_frame_is_current(self) -> bool:
++        """False when the selected frame is not the one last DECODED. Sorting
++        shows each frame's thumbnail and applies its look but skips the
++        decode, and a failed load keeps the previous frame's pixels: the input
++        layers -- and any render or kept print made from them -- then belong
++        to another frame."""
++        current = self._current_input_path
++        if not current:
++            return True
++        loaded = self._loaded_input_path
++        return loaded is not None and (
++            os.path.normcase(os.path.abspath(loaded))
++            == os.path.normcase(os.path.abspath(current)))
++
++    def _load_selected_frame(self, *, render_follows: bool = False) -> bool:
++        """Before anything that renders, edits or writes the selected frame's
++        pixels, make sure they are its own: from sorting, leave input mode
++        (what picking Print does), else load it. False when it could not be
++        loaded, so the caller stops instead of using another frame's pixels
++        under this one's name."""
++        # A render from sorting also leaves it, properly: the finished render
++        # only cleared the flag, leaving the side panels hidden and locked.
++        if self._loaded_frame_is_current() and not (render_follows and self._input_mode):
++            return True
++        if self._input_mode:
++            self.set_input_mode(False)
++        elif self._roll.current is not None:
++            self._roll_load_current(restore_state=False)    # the panels are its look
++        else:
++            self._reload_current_input()
++        if not self._loaded_frame_is_current():
++            set_status(self._viewer, 'Could not load the selected frame')
++            return False
++        # The load queued an auto preview. A caller that renders anyway does
++        # not want it replayed after its own render (it replaced a Scan).
++        if render_follows and self._auto_preview_scheduled:
++            self._skip_scheduled_auto_preview = True
++        return True
++
+     def _set_side_panels_visible(self, visible: bool) -> None:
+         hook = getattr(self, '_set_side_panels', None)
+         if callable(hook):
+--- a/src/spektrafilm_gui/controller_roll_file.py
++++ b/src/spektrafilm_gui/controller_roll_file.py
+@@ -358,11 +358,23 @@
+         if self._input_mode:
+             self._current_input_path = roll_file.path
+             self._input_mode_navigated = True
++            # The frame's LOOK still comes with it (cheap: no decode), so the
++            # panels always belong to the selected frame -- what a frame
++            # switch stores, Copy settings copies and Apply to all applies.
++            if restore_state:
++                stored = self._roll.state_for(roll_file)
++                if stored is not None:
++                    apply_gui_state(stored, widgets=self._widgets)
++                    self._note_film_stock_synced()
++                    self._sync_canvas_background()
++                    self._warn_if_missing_custom_stock()
+             self._widgets.filepicker.cancel_scheduled_reprocess()
+             self._widgets.load_raw.cancel_scheduled_reprocess()
+             image = self._show_instant_input()
+             if image is not None:
+                 self._update_banner_and_metadata(image)
++            self._mark_roll_entry_look()
++            self._refresh_attempts_view()
+             return
+         if restore_state:
+             stored = self._roll.state_for(roll_file)
