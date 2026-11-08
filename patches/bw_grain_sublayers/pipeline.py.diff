@@ -1,0 +1,93 @@
+--- a/src/spektrafilm/runtime/pipeline.py
++++ b/src/spektrafilm/runtime/pipeline.py
+@@ -8,12 +8,14 @@
+ #   materialization and _DEVICE_TAP_MAX_BYTES (G5, 16C taps); the single-copy
+ #   `_preprocess` with auto_exposure(owned=True), and its f32 preview host
+ #   path (`preview_host_f32`, NAT 2026-09-28), and its one NaN/Inf clamp
+-#   (`clamp_non_finite`).
++#   (`clamp_non_finite`); the grain sub-layer reconcile ahead of the bake
++#   (`_reconcile_grain_sublayers`, for the stale B&W sub-layers).
+ # UPSTREAM: the topology, services, stages, select_development_time.
+ # ON CONFLICT: keep ours for __init__'s bake and `process`; port their new
+ #   nodes/services in by hand. Do NOT restore refresh_density_curves_from_model
+-#   unconditionally -- it moves the default render. Untouched upstream
+-#   since 28bf883.
++#   unconditionally -- it moves the default render -- and keep
++#   `_reconcile_grain_sublayers`, which upstream does not need. Untouched
++#   upstream since 28bf883.
+ # Convention and rationale: docs/reports/2026.08.20_fork_contracts.md
+ # -------------------------------------------------------------------------
+ 
+@@ -27,7 +29,7 @@
+ import colour
+ import numpy as np
+ 
+-from spektrafilm.model.density_curves import select_development_time
++from spektrafilm.model.density_curves import evaluate_density_curves_layers, select_development_time
+ from spektrafilm.utils.finite_input import clamp_non_finite
+ from spektrafilm.utils.morph_curves import apply_print_curves_morph_with_layers
+ from spektrafilm.runtime.services import (
+@@ -85,6 +87,22 @@
+             select_development_time(
+                 self.print.data, self.print_render.chemistry.development_time)
+ 
++        # The grain splits each pixel's density over the sub-layer curves and
++        # sums the grained sub-layers back, so those curves must add up to the
++        # total curve or the grain moves the mean density. The shipped B&W
++        # stocks (kodak_trix, kodak_doublex, and kodak_2302 when selected as a
++        # film) carry stale sub-layer arrays that do not (Tri-X is off by up
++        # to 0.89 density), which moved the tonality of their grained renders
++        # (outside push/pull, whose bake regenerates them) away from the
++        # grain-free preview. Upstream misses it because it regenerates both
++        # arrays from the model unconditionally. Here only the sub-layers are
++        # regenerated, and only when they disagree with the total: the total,
++        # and every colour stock (all within 0.0052), pass through
++        # byte-identical. Before the bakes below, so expiration starts
++        # from consistent sub-layers.
++        if self.film is not None:
++            _reconcile_grain_sublayers(self.film.data, self.film.info.type)
++
+         # Bake the film chemistry morph (experimental push/pull: coupled gamma /
+         # developer exhaustion) into the film curves, regenerating the grain
+         # sublayers from the same morphed parameters so grain stays consistent.
+@@ -442,3 +460,40 @@
+ #: Largest intermediate tap kept on the device in device_result mode (f32 RGB):
+ #: 256 MiB is a 22 MP frame. Bigger taps come back as host arrays, as before.
+ _DEVICE_TAP_MAX_BYTES = 256 * 1024 * 1024
++
++
++#: Largest |sum(sub-layers) - total| (density) a film's grain sub-layers may
++#: show before they are regenerated from the model. The shipped colour stocks
++#: sit at <= 0.0052 (the total carries measurement ripples the layer sum does
++#: not); the stale B&W ones at 0.08 to 0.89.
++_SUBLAYER_SUM_TOLERANCE = 0.01
++
++
++def _reconcile_grain_sublayers(film_data, profile_type) -> None:
++    """Regenerate `density_curves_layers` from the density model when the
++    shipped sub-layers do not sum to the total curve but the model's do.
++
++    Leaves everything untouched when there are no sub-layers or no
++    multi-layer model, when the shipped sub-layers are already consistent,
++    when the model cannot be evaluated, or when the model would not be more
++    consistent (a custom or edited total the model does not describe)."""
++    layers = getattr(film_data, 'density_curves_layers', None)
++    model = getattr(film_data, 'density_curves_model', None)
++    if layers is None or model is None or getattr(model, 'n_layers', 0) < 2:
++        return
++    layers = np.asarray(layers, dtype=float)
++    total = np.asarray(film_data.density_curves, dtype=float)
++    if layers.ndim != 3 or layers.shape[0] != total.shape[0] or layers.shape[2] != total.shape[1]:
++        return
++    shipped_error = float(np.nanmax(np.abs(np.nansum(layers, axis=1) - total)))
++    if not shipped_error > _SUBLAYER_SUM_TOLERANCE:    # also leaves an all-NaN error alone
++        return
++    try:
++        candidate = evaluate_density_curves_layers(model, film_data.log_exposure, profile_type)
++    except ValueError:
++        return                          # unknown model type: keep the shipped arrays
++    if candidate.shape != layers.shape:
++        return
++    model_error = float(np.nanmax(np.abs(np.nansum(candidate, axis=1) - total)))
++    if model_error <= _SUBLAYER_SUM_TOLERANCE and model_error < shipped_error:
++        film_data.density_curves_layers = candidate
