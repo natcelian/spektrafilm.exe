@@ -1,0 +1,38 @@
+--- a/src/spektrafilm_gui/controller.py
++++ b/src/spektrafilm_gui/controller.py
+@@ -690,6 +690,7 @@
+     # ------------------------------------------------------------------
+     _rating_filter = 0
+     _single_rating = 0    # rating of the loaded image when there is no roll
++    _single_rating_path = None    # ...and which image it was given to
+ 
+     # ------------------------------------------------------------------
+     # The filmstrip's right-click menu, BY INDEX (NAT 2026-08-25: "copy
+@@ -1998,13 +1999,20 @@
+             except Exception:
+                 metadata = None
+         metadata_panel = getattr(self._widgets, 'metadata', None)
+-        if metadata_panel is not None and metadata is not None:
+-            try:
+-                read_camera_lens = import_module('spektrafilm.utils.io').read_camera_lens_model
+-                camera, lens = read_camera_lens(metadata)
+-                metadata_panel.set_camera_lens(camera, lens)
+-            except Exception:
+-                pass
++        if metadata_panel is not None:
++            # Also for a file with no readable metadata: its export must not
++            # carry the previous file's camera and lens.
++            camera, lens = '', ''
++            if metadata is not None:
++                try:
++                    read_camera_lens = import_module('spektrafilm.utils.io').read_camera_lens_model
++                    camera, lens = read_camera_lens(metadata)
++                except Exception:
++                    camera, lens = '', ''
++            metadata_panel.set_camera_lens(camera, lens)
++        # The stars follow the new image too (a single image's rating is its
++        # own: `_current_rating`).
++        self._sync_rating_panel()
+         self._update_file_facts(image, metadata)
+ 
+     @staticmethod
