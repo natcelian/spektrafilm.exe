@@ -1,0 +1,35 @@
+--- a/src/spektrafilm_gui/controller_profile_sync.py
++++ b/src/spektrafilm_gui/controller_profile_sync.py
+@@ -2,7 +2,9 @@
+ # FORK CONTRACT -- upstream has this file too, and both sides edit it.
+ # OURS: PROFILE_SYNC_FIELDS, per-FIELD rather than upstream's per-section
+ #   list, so a stock switch overwrites only stock-owned values; 'special' is
+-#   excluded on purpose (it compounded push/pull gamma, 2026-07-12);
++#   excluded on purpose (it compounded push/pull gamma, 2026-07-12), and
++#   so is simulation.exposure_compensation_ev (it compounded Film exposure
++#   into Camera exposure, 2026-11-01);
+ #   grain.rms_granularity added in 20C; Phase 15 update_baselines.
+ # UPSTREAM: the idea: sync widgets to the chosen profile's defaults.
+ # ON CONFLICT: KEEP OURS. Map any section upstream adds to
+@@ -100,11 +102,20 @@
+     # 'profile change stacks' report, 2026-07-12); print_gamma_factor was
+     # hard-reset to 1.0 by the same path. A profile switch now leaves both
+     # exactly as the user set them.
++    #
++    # 'exposure_compensation_ev' (Camera exposure) is left out for the same
++    # reason: _apply_camera composes it with Film exposure into
++    # params.camera.exposure_compensation_ev, and gui_state_from_params reads
++    # that SUM back, so every switch added Film exposure to Camera exposure
++    # again (-1, -2, -3 ... with Film exposure at -1; a paper change always,
++    # a film change whenever Camera exposure had not been edited since the
++    # last stock sync; pixls.us report). The composed sum also became the
++    # Reset baseline. No stock sets it, so it is a user knob, not a
++    # selection default.
+     'simulation': (
+         'film_stock',
+         'film_format_mm',
+         'camera_lens_blur_um',
+-        'exposure_compensation_ev',
+         'auto_exposure',
+         'auto_exposure_method',
+         'print_paper',
