@@ -1,0 +1,113 @@
+--- a/src/spektrafilm/utils/crop_resize.py
++++ b/src/spektrafilm/utils/crop_resize.py
+@@ -4,7 +4,8 @@
+ #   `crop_geometry_output_shape`, `map_point_through_crop_geometry`
+ #   (anamorphic desqueeze, straighten, and re-projecting a drawn crop corner
+ #   through both), plus the clamp in `crop_image` that stops a non-square
+-#   crop wrapping into a thin band (NAT 2026-07-27).
++#   crop wrapping into a thin band (NAT 2026-07-27), and `SKEW_FILL`, what
++#   shows outside the turned picture.
+ # UPSTREAM: `crop_image` and its centre/size convention.
+ # ON CONFLICT: take theirs, re-add the four functions verbatim (additions;
+ #   nothing of theirs calls them); re-apply the clamp if their `crop_image`
+@@ -36,20 +37,28 @@
+     return skimage.transform.rescale(image, scale, channel_axis=2, order=3)
+ 
+ 
++#: What fills the corners a turn brings into the frame: white, like the
++#: paper around the print. It used to be the picture's own edge pixels
++#: replicated outward, which read as a smeared, stretched photo. Keep in
++#: step with SKEW_FILL in gpu/shaders/scan_geometry.wgsl.
++SKEW_FILL = 1.0
++
++
+ def apply_skew(image, skew_deg=0.0):
+     """Rotate the full frame by ``skew_deg`` (degrees, CCW positive, +-45)
+     about the image center, BEFORE the crop — so the crop rectangle stays
+     axis-aligned while the user straightens or tilts the framing.
+ 
+     Matches NegPy's fine-rotation transform: full-frame affine at scale 1.0
+-    (no zoom-to-fill), bilinear interpolation, edges replicated. Corners that
+-    rotate out of frame are meant to be cut away by the crop.
++    (no zoom-to-fill), bilinear interpolation. Corners that rotate in from
++    outside the picture are `SKEW_FILL`; the crop is meant to cut them away.
+     """
+     angle = float(skew_deg)
+     if angle == 0.0:
+         return image
+     return skimage.transform.rotate(
+-        image, angle, resize=False, center=None, order=1, mode='edge')
++        image, angle, resize=False, center=None, order=1, mode='constant',
++        cval=SKEW_FILL)
+ 
+ 
+ def crop_geometry_output_shape(shape_hw, desqueeze=0.0):
+--- a/src/spektrafilm/gpu/scan_geometry.py
++++ b/src/spektrafilm/gpu/scan_geometry.py
+@@ -7,8 +7,9 @@
+               compressing] -> ndi.zoom(order=3, grid_mode=True,
+               mode='mirror') -> clip to the input's range. Separable along
+               the one scaled axis.
+-  skew      = skimage rotate(order=1, mode='edge'): per-channel bilinear at
+-              M @ (c, r, 1), edge-clamped. M is skimage's OWN transform
++  skew      = skimage rotate(order=1, mode='constant', cval=SKEW_FILL):
++              per-channel bilinear at M @ (c, r, 1), a neighbour outside the
++              picture reading SKEW_FILL. M is skimage's OWN transform
+               matrix, built here the way rotate builds it.
+ 
+ Tiling: a desqueeze line (row or column) is independent of every other, so
+--- a/src/spektrafilm/gpu/shaders/scan_geometry.wgsl
++++ b/src/spektrafilm/gpu/shaders/scan_geometry.wgsl
+@@ -8,8 +8,9 @@
+ //     evaluated at the knots of the unscaled axis gives that axis's samples
+ //     back, so only the scaled axis is prefiltered and interpolated.
+ //     Passes: aa_blur (optional) -> prefilter -> zoom_cubic.
+-//   SKEW = skimage.transform.rotate(order=1, mode='edge') = _warp_fast
+-//     bilinear per channel with edge-clamped indices, sampled at M @ (c, r, 1).
++//   SKEW = skimage.transform.rotate(order=1, mode='constant', cval=SKEW_FILL)
++//     = _warp_fast bilinear per channel, a neighbour outside the picture
++//     reading SKEW_FILL, sampled at M @ (c, r, 1).
+ //
+ // Both written against an f64 numpy reference that matches skimage to
+ // ~1e-15 (desqueeze) and exactly (skew). Sample positions are computed
+@@ -309,10 +310,15 @@
+     return vec2<f32>(i, f);
+ }
+ 
++// crop_resize.SKEW_FILL: white outside the picture, like the paper
++const SKEW_FILL: f32 = 1.0;
++
+ fn spx(r: i32, c: i32, ch: u32) -> f32 {
+-    let rr = clamp(r, 0, i32(sp.rows) - 1) - i32(sp.in_r0);   // edge mode, then band-relative
+-    let cc = clamp(c, 0, i32(sp.cols) - 1);
+-    return ssrc[(u32(rr) * sp.cols + u32(cc)) * 3u + ch];
++    if (r < 0 || r >= i32(sp.rows) || c < 0 || c >= i32(sp.cols)) {
++        return SKEW_FILL;                                       // constant mode
++    }
++    let rr = r - i32(sp.in_r0);                                 // band-relative
++    return ssrc[(u32(rr) * sp.cols + u32(c)) * 3u + ch];
+ }
+ 
+ @compute @workgroup_size(8, 8, 1)
+--- a/src/spektrafilm_gui/crop_frame.py
++++ b/src/spektrafilm_gui/crop_frame.py
+@@ -263,7 +263,7 @@
+ 
+ #: How far inside the rotated image's mathematical edge the crop stays, in
+ #: image px: the renderer's bilinear resample blends the last pixel with the
+-#: replicated edge, and skimage centres the turn on (W-1)/2 -- about 1.5 px
++#: fill, and skimage centres the turn on (W-1)/2 -- about 1.5 px
+ #: together, measured against apply_skew.
+ ROTATED_FIT_INSET_PX = 2.0
+ 
+--- a/src/spektrafilm_gui/widget_specs.py
++++ b/src/spektrafilm_gui/widget_specs.py
+@@ -1325,7 +1325,7 @@
+         ),
+         "skew_deg": WidgetSpec(
+             label="Skew",
+-            tooltip="Rotate the rendered film under the scanner (degrees, counter-clockwise positive) before the scan crop - straighten horizons while the crop stays axis-aligned. Edges replicate; crop away the corners.",
++            tooltip="Rotate the rendered film under the scanner (degrees, counter-clockwise positive) before the scan crop - straighten horizons while the crop stays axis-aligned. The corners outside the photo are white; crop them away.",
+             min_value=-45.0, max_value=45.0, step=0.1, decimals=1,
+         ),
+         "desqueeze": WidgetSpec(
